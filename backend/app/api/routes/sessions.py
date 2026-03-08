@@ -3,10 +3,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
-from app.api.deps import get_session_service
+from app.api.deps import get_session_service, get_workspace_service
 from app.schemas.common import ApiMessage
 from app.schemas.session import SessionCreate, SessionRead
+from app.schemas.workspace import WorkspaceStatusRead
 from app.services.session_service import SessionService
+from app.services.workspace_service import WorkspaceService
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -33,6 +35,22 @@ def get_session(
     service: SessionService = Depends(get_session_service),
 ) -> SessionRead:
     return service.get_session(session_id)
+
+
+@router.get("/{session_id}/workspace", response_model=WorkspaceStatusRead)
+def get_session_workspace(
+    session_id: UUID,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceStatusRead:
+    return service.get_session_workspace(session_id)
+
+
+@router.post("/{session_id}/workspace", response_model=WorkspaceStatusRead)
+def create_session_workspace(
+    session_id: UUID,
+    service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceStatusRead:
+    return service.provision_session_workspace(session_id)
 
 
 @router.post("/{session_id}/stop", response_model=ApiMessage)

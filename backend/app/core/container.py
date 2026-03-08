@@ -57,7 +57,7 @@ def build_container(settings: Settings) -> ServiceContainer:
     command_runner = CommandRunner()
     repo_inspector = RepoInspectorAdapter(command_runner)
     session_supervisor = SessionSupervisor()
-    worktree_manager = WorktreeManager(settings)
+    worktree_manager = WorktreeManager(settings, command_runner)
     orchestrator = OrchestratorService(worktree_manager, session_supervisor)
 
     return ServiceContainer(

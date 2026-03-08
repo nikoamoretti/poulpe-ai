@@ -19,6 +19,7 @@ from app.schemas.session import SessionCreate, SessionRead
 from app.services.event_service import EventService
 from app.services.session_supervisor import SessionSupervisor
 from app.services.worktree_manager import WorktreeManager
+from app.services.workspace_service import WorkspaceService
 
 
 class SessionService:
@@ -29,12 +30,14 @@ class SessionService:
         session_supervisor: SessionSupervisor,
         worktree_manager: WorktreeManager,
         repo_inspector: RepoInspectorAdapter,
+        workspace_service: WorkspaceService,
     ) -> None:
         self.db = db
         self.event_service = event_service
         self.session_supervisor = session_supervisor
         self.worktree_manager = worktree_manager
         self.repo_inspector = repo_inspector
+        self.workspace_service = workspace_service
 
     def list_sessions(self, project_id: UUID | None = None) -> list[SessionRead]:
         stmt = select(SessionModel).order_by(SessionModel.created_at.desc())
@@ -104,8 +107,14 @@ class SessionService:
                 base_commit=repo_info.current_commit or "",
                 head_commit=repo_info.current_commit,
                 workspace_path=workspace_plan.workspace_path,
-                status=WorkspaceStatus.PLANNED,
-                metadata_json={},
+                status=workspace_plan.status,
+                metadata_json={
+                    "ownership": {
+                        "session_id": str(session.id),
+                        "path_lock_owner": str(session.id),
+                        "path_locks": [],
+                    }
+                },
             )
             self.db.add(workspace)
             session.branch_name = workspace.branch_name
@@ -146,6 +155,9 @@ class SessionService:
                     },
                 )
             )
+        if payload.role == SessionRole.WORKER:
+            self.workspace_service.provision_session_workspace(session.id)
+            self.db.refresh(session)
         return SessionRead.model_validate(session)
 
     def stop_session(self, session_id: UUID) -> ApiMessage:

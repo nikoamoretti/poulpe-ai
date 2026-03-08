@@ -10,6 +10,7 @@ from app.services.project_service import ProjectService
 from app.services.review_service import ReviewService
 from app.services.session_service import SessionService
 from app.services.task_service import TaskService
+from app.services.workspace_service import WorkspaceService
 
 
 def get_container(request: Request) -> ServiceContainer:
@@ -52,17 +53,39 @@ def get_task_service(
     return TaskService(db=db, event_service=event_service)
 
 
+def get_workspace_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+    container: ServiceContainer = Depends(get_container),
+) -> WorkspaceService:
+    return WorkspaceService(
+        db=db,
+        event_service=event_service,
+        worktree_manager=container.worktree_manager,
+        repo_inspector=container.repo_inspector,
+        command_runner=container.command_runner,
+    )
+
+
 def get_session_service(
     db: Session = Depends(get_db),
     event_service: EventService = Depends(get_event_service),
     container: ServiceContainer = Depends(get_container),
 ) -> SessionService:
+    workspace_service = WorkspaceService(
+        db=db,
+        event_service=event_service,
+        worktree_manager=container.worktree_manager,
+        repo_inspector=container.repo_inspector,
+        command_runner=container.command_runner,
+    )
     return SessionService(
         db=db,
         event_service=event_service,
         session_supervisor=container.session_supervisor,
         worktree_manager=container.worktree_manager,
         repo_inspector=container.repo_inspector,
+        workspace_service=workspace_service,
     )
 
 

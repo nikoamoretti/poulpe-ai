@@ -44,6 +44,48 @@ def test_project_task_session_review_flow(client, git_repo: Path) -> None:
     assert session["status"] == "pending"
     assert session["workspace_path"].endswith(session["id"])
     assert session["branch_name"].startswith("orchestrator/worker/")
+    assert Path(session["workspace_path"]).exists()
+
+    workspace_response = client.get(f"/api/v1/sessions/{session['id']}/workspace")
+    assert workspace_response.status_code == 200
+    workspace = workspace_response.json()
+    assert workspace["status"] == "ready"
+    assert workspace["changed_files"] == []
+    assert workspace["workspace_path"] == session["workspace_path"]
+
+    reprovision_response = client.post(f"/api/v1/sessions/{session['id']}/workspace")
+    assert reprovision_response.status_code == 200
+    assert reprovision_response.json()["id"] == workspace["id"]
+
+    workspace_readme = Path(workspace["workspace_path"]) / "README.md"
+    workspace_readme.write_text("# Sample Repo\n\nworkspace change\n", encoding="utf-8")
+
+    diff_response = client.get(f"/api/v1/workspaces/{workspace['id']}/diff")
+    assert diff_response.status_code == 200
+    diff_payload = diff_response.json()
+    assert diff_payload["status"] == "dirty"
+    assert diff_payload["changed_files"] == ["README.md"]
+    assert "workspace change" in diff_payload["diff"]
+
+    lint_response = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/lint",
+        json={"command": "git diff --stat"},
+    )
+    assert lint_response.status_code == 200
+    lint_result = lint_response.json()
+    assert lint_result["kind"] == "lint"
+    assert lint_result["returncode"] == 0
+    assert "README.md" in lint_result["stdout"]
+
+    tests_response = client.post(
+        f"/api/v1/workspaces/{workspace['id']}/tests",
+        json={"command": "git status --short"},
+    )
+    assert tests_response.status_code == 200
+    tests_result = tests_response.json()
+    assert tests_result["kind"] == "tests"
+    assert tests_result["returncode"] == 0
+    assert "README.md" in tests_result["stdout"]
 
     sessions_response = client.get("/api/v1/sessions", params={"project_id": project["id"]})
     assert sessions_response.status_code == 200
@@ -70,6 +112,8 @@ def test_project_task_session_review_flow(client, git_repo: Path) -> None:
     assert "project.created" in event_types
     assert "task.created" in event_types
     assert "session.created" in event_types
+    assert "worktree.provision_requested" in event_types
+    assert "worktree.ready" in event_types
     assert "review.requested" in event_types
 
 
