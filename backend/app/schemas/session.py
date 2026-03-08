@@ -1,0 +1,37 @@
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+from pydantic import Field
+
+from app.core.enums import SessionRole, SessionStatus, SessionTransport
+from app.schemas.common import ORMModel
+
+
+class SessionCreate(ORMModel):
+    project_id: UUID
+    task_id: UUID | None = None
+    supervisor_session_id: UUID | None = None
+    role: SessionRole
+    command_override: str | None = None
+    model: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionRead(ORMModel):
+    id: UUID
+    project_id: UUID
+    task_id: UUID | None = None
+    supervisor_session_id: UUID | None = None
+    role: SessionRole
+    status: SessionStatus
+    transport: SessionTransport
+    branch_name: str | None = None
+    workspace_path: str | None = None
+    command: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_json")
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime

@@ -1,0 +1,73 @@
+from collections.abc import Generator
+
+from fastapi import Depends, Request
+from sqlalchemy.orm import Session
+
+from app.core.container import ServiceContainer
+from app.core.database import get_db as get_database_session
+from app.services.event_service import EventService
+from app.services.project_service import ProjectService
+from app.services.review_service import ReviewService
+from app.services.session_service import SessionService
+from app.services.task_service import TaskService
+
+
+def get_container(request: Request) -> ServiceContainer:
+    return request.app.state.container
+
+
+def get_db(
+    container: ServiceContainer = Depends(get_container),
+) -> Generator[Session, None, None]:
+    yield from get_database_session(container.database)
+
+
+def get_event_service(
+    db: Session = Depends(get_db),
+    container: ServiceContainer = Depends(get_container),
+) -> EventService:
+    return EventService(
+        db=db,
+        redis_bus=container.redis_bus,
+        event_broker=container.event_broker,
+    )
+
+
+def get_project_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+    container: ServiceContainer = Depends(get_container),
+) -> ProjectService:
+    return ProjectService(
+        db=db,
+        event_service=event_service,
+        repo_inspector=container.repo_inspector,
+    )
+
+
+def get_task_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+) -> TaskService:
+    return TaskService(db=db, event_service=event_service)
+
+
+def get_session_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+    container: ServiceContainer = Depends(get_container),
+) -> SessionService:
+    return SessionService(
+        db=db,
+        event_service=event_service,
+        session_supervisor=container.session_supervisor,
+        worktree_manager=container.worktree_manager,
+        repo_inspector=container.repo_inspector,
+    )
+
+
+def get_review_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+) -> ReviewService:
+    return ReviewService(db=db, event_service=event_service)

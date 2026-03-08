@@ -1,0 +1,277 @@
+:root {
+  --bg: #f5f1e8;
+  --bg-panel: rgba(255, 250, 240, 0.78);
+  --bg-strong: #fff9ee;
+  --line: rgba(28, 35, 31, 0.14);
+  --ink: #1c231f;
+  --ink-soft: #506056;
+  --accent: #c55a11;
+  --accent-soft: rgba(197, 90, 17, 0.12);
+  --success: #1f6f52;
+  --warning: #9d6c00;
+  --stubbed: #7e5d00;
+  --shadow: 0 20px 50px rgba(50, 42, 23, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(197, 90, 17, 0.16), transparent 30%),
+    radial-gradient(circle at right 10% top 20%, rgba(31, 111, 82, 0.12), transparent 28%),
+    var(--bg);
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-display), sans-serif;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.page-shell {
+  min-height: 100vh;
+  padding: 32px 20px 48px;
+}
+
+.page-grid {
+  max-width: 1240px;
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+}
+
+.hero,
+.panel,
+.rail {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(20px);
+  animation: rise-in 420ms ease both;
+}
+
+.hero {
+  padding: 28px;
+  display: grid;
+  gap: 18px;
+}
+
+.hero-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.eyebrow,
+.code-label {
+  font-family: var(--font-mono), monospace;
+  font-size: 0.82rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+
+.hero h1,
+.section-head h2 {
+  margin: 0;
+  font-weight: 700;
+  line-height: 0.98;
+}
+
+.hero h1 {
+  font-size: clamp(2.5rem, 6vw, 5.8rem);
+  max-width: 9ch;
+}
+
+.hero p,
+.card p,
+.section-head p,
+.rail p {
+  margin: 0;
+  color: var(--ink-soft);
+  line-height: 1.55;
+}
+
+.hero-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.65);
+  font-family: var(--font-mono), monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.pill[data-tone="ready"] {
+  color: var(--success);
+}
+
+.pill[data-tone="scaffolded"] {
+  color: var(--accent);
+}
+
+.pill[data-tone="stubbed"] {
+  color: var(--stubbed);
+}
+
+.pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.stats-grid,
+.card-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+
+.stat-card,
+.card,
+.rail {
+  padding: 22px;
+}
+
+.stat-card {
+  grid-column: span 4;
+  background: var(--bg-strong);
+  border: 1px solid var(--line);
+  border-radius: 22px;
+}
+
+.stat-card strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 1.8rem;
+}
+
+.panel {
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.section-head {
+  display: grid;
+  gap: 8px;
+}
+
+.card {
+  grid-column: span 4;
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.56);
+}
+
+.card ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--ink-soft);
+}
+
+.card li + li {
+  margin-top: 6px;
+}
+
+.two-up {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.9fr);
+}
+
+.rail {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.rail-list {
+  display: grid;
+  gap: 12px;
+}
+
+.rail-item {
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.rail-item strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 980px) {
+  .two-up,
+  .stats-grid,
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stat-card,
+  .card {
+    grid-column: auto;
+  }
+
+  .hero-top {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 640px) {
+  .page-shell {
+    padding: 18px 14px 28px;
+  }
+
+  .hero,
+  .panel,
+  .rail {
+    border-radius: 22px;
+  }
+
+  .hero h1 {
+    max-width: none;
+  }
+}
+
