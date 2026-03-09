@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, Text, Uuid, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.enums import SessionRole, SessionStatus, SessionTransport
@@ -36,10 +36,15 @@ class Session(Base):
         default=SessionTransport.LOCAL_PROCESS,
         nullable=False,
     )
+    adapter_kind: Mapped[str] = mapped_column(String(120), default="codex_local", nullable=False)
     branch_name: Mapped[str | None] = mapped_column(String(255))
     workspace_path: Mapped[str | None] = mapped_column(Text)
     command: Mapped[str | None] = mapped_column(Text)
+    pid: Mapped[int | None] = mapped_column(Integer)
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    blocked_reason: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    runtime_metadata_json: Mapped[dict[str, Any]] = mapped_column("runtime_metadata", JSON, default=dict, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

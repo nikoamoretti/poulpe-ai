@@ -36,12 +36,21 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://orchestrator:orchestrator@postgres:5432/orchestrator}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_REQUESTS: ${LOG_REQUESTS:-true}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      SEED_DEMO_DATA_IF_EMPTY: ${SEED_DEMO_DATA_IF_EMPTY:-true}
       ORCHESTRATOR_REPOS_ROOT: ${ORCHESTRATOR_REPOS_ROOT:-/workspace/.orchestrator/repos}
       ORCHESTRATOR_WORKSPACES_ROOT: ${ORCHESTRATOR_WORKSPACES_ROOT:-/workspace/.orchestrator/workspaces}
     volumes:
       - ./:/workspace
     ports:
       - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,7 +71,8 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:

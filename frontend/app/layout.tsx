@@ -16,8 +16,8 @@ const mono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Local Agent Orchestrator v0",
-  description: "Local-first multi-agent coding orchestrator scaffold.",
+  title: "Local Agent Orchestrator Console",
+  description: "Operator console for projects, tasks, sessions, live events, and reviews.",
 };
 
 export default function RootLayout({

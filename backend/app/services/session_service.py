@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -15,11 +16,20 @@ from app.models.task import Task
 from app.models.workspace import Workspace
 from app.schemas.common import ApiMessage
 from app.schemas.event import EventCreate, EventSourceRef
-from app.schemas.session import SessionCreate, SessionRead
+from app.schemas.session import (
+    SessionCreate,
+    SessionMessageRequest,
+    SessionRead,
+    SessionStartRequest,
+)
+from app.schemas.structured_event import ParsedSessionEventRead
+from app.schemas.transcript import TranscriptChunkRead
 from app.services.event_service import EventService
 from app.services.session_supervisor import SessionSupervisor
 from app.services.worktree_manager import WorktreeManager
 from app.services.workspace_service import WorkspaceService
+
+logger = logging.getLogger(__name__)
 
 
 class SessionService:
@@ -40,6 +50,7 @@ class SessionService:
         self.workspace_service = workspace_service
 
     def list_sessions(self, project_id: UUID | None = None) -> list[SessionRead]:
+        self.db.expire_all()
         stmt = select(SessionModel).order_by(SessionModel.created_at.desc())
         if project_id is not None:
             stmt = stmt.where(SessionModel.project_id == project_id)
@@ -47,6 +58,8 @@ class SessionService:
         return [SessionRead.model_validate(record) for record in records]
 
     def get_session(self, session_id: UUID) -> SessionRead:
+        self.session_supervisor.refresh_session_runtime(session_id)
+        self.db.expire_all()
         session = self.db.get(SessionModel, session_id)
         if session is None:
             raise NotFoundError(f"Session not found: {session_id}")
@@ -71,10 +84,13 @@ class SessionService:
         launch_plan = self.session_supervisor.plan_session(
             role=payload.role,
             command_override=payload.command_override,
+            adapter_kind=payload.adapter_kind,
+            simulation_mode=payload.simulation_mode,
         )
         metadata = dict(payload.metadata)
         if payload.model is not None:
             metadata["model"] = payload.model
+        metadata["simulation_mode"] = launch_plan.simulation_mode
         metadata["launch_notes"] = launch_plan.notes
 
         session = SessionModel(
@@ -84,8 +100,10 @@ class SessionService:
             role=payload.role,
             status=launch_plan.initial_status,
             transport=launch_plan.transport,
+            adapter_kind=launch_plan.adapter_kind,
             command=launch_plan.command,
             metadata_json=metadata,
+            runtime_metadata_json={},
         )
         self.db.add(session)
         self.db.flush()
@@ -158,31 +176,56 @@ class SessionService:
         if payload.role == SessionRole.WORKER:
             self.workspace_service.provision_session_workspace(session.id)
             self.db.refresh(session)
+        logger.info(
+            "created %s session %s for project=%s task=%s adapter=%s",
+            session.role.value,
+            session.id,
+            session.project_id,
+            session.task_id,
+            session.adapter_kind,
+        )
         return SessionRead.model_validate(session)
 
-    def stop_session(self, session_id: UUID) -> ApiMessage:
+    def start_session(self, session_id: UUID, payload: SessionStartRequest) -> SessionRead:
+        self.session_supervisor.start_session(session_id, initial_message=payload.initial_message)
+        logger.info("start requested for session %s", session_id)
+        return self.get_session(session_id)
+
+    def send_instruction(self, session_id: UUID, payload: SessionMessageRequest) -> ApiMessage:
+        self.session_supervisor.send(session_id, payload.message)
+        self.db.expire_all()
         session = self.db.get(SessionModel, session_id)
         if session is None:
             raise NotFoundError(f"Session not found: {session_id}")
-
-        session.status = self.session_supervisor.stop_session(session.status)
-        session.ended_at = session.ended_at or datetime.now(UTC)
-        self.db.commit()
-        self.db.refresh(session)
-
-        self.event_service.record_event(
-            EventCreate(
-                category=EventCategory.SESSION,
-                event_type="session.stopped",
-                level=EventLevel.INFO,
-                source=EventSourceRef(kind="api", role=session.role, id="sessions.stop"),
-                project_id=session.project_id,
-                task_id=session.task_id,
-                session_id=session.id,
-                payload={"status": SessionStatus.STOPPED.value},
-            )
-        )
         return ApiMessage(
-            detail=f"Session {session_id} marked as stopped.",
+            detail=f"Instruction delivered to session {session_id} ({session.status.value}).",
+            generated_at=datetime.now(UTC),
+        )
+
+    def interrupt_session(self, session_id: UUID) -> ApiMessage:
+        self.session_supervisor.interrupt(session_id)
+        self.db.expire_all()
+        session = self.db.get(SessionModel, session_id)
+        if session is None:
+            raise NotFoundError(f"Session not found: {session_id}")
+        return ApiMessage(
+            detail=f"Interrupt sent to session {session_id} ({session.status.value}).",
+            generated_at=datetime.now(UTC),
+        )
+
+    def list_transcript(self, session_id: UUID, limit: int = 200) -> list[TranscriptChunkRead]:
+        return self.session_supervisor.list_transcript(session_id, limit=limit)
+
+    def list_structured_events(
+        self,
+        session_id: UUID,
+        limit: int = 200,
+    ) -> list[ParsedSessionEventRead]:
+        return self.session_supervisor.list_structured_events(session_id, limit=limit)
+
+    def stop_session(self, session_id: UUID) -> ApiMessage:
+        self.session_supervisor.stop(session_id)
+        return ApiMessage(
+            detail=f"Stop requested for session {session_id}.",
             generated_at=datetime.now(UTC),
         )

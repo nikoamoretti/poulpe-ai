@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.adapters.codex_local import CodexLocalAdapter
+from app.adapters.event_parser import EventParserAdapter
 from app.adapters.redis_bus import RedisBusAdapter
 from app.adapters.repo_inspector import RepoInspectorAdapter
+from app.adapters.process_supervisor import ProcessSupervisorAdapter
 from app.core.config import Settings
 from app.core.database import DatabaseManager, build_database_manager
 from app.core.event_stream import EventStreamBroker
@@ -19,8 +22,10 @@ class ServiceContainer:
     database: DatabaseManager
     redis_bus: RedisBusAdapter
     event_broker: EventStreamBroker
+    event_parser: EventParserAdapter
     command_runner: CommandRunner
     repo_inspector: RepoInspectorAdapter
+    process_supervisor: ProcessSupervisorAdapter
     session_supervisor: SessionSupervisor
     worktree_manager: WorktreeManager
     orchestrator: OrchestratorService
@@ -29,6 +34,7 @@ class ServiceContainer:
         self.settings.ensure_local_dirs()
 
     def shutdown(self) -> None:
+        self.session_supervisor.shutdown()
         self.redis_bus.close()
         self.database.dispose()
 
@@ -54,19 +60,46 @@ def build_container(settings: Settings) -> ServiceContainer:
     database = build_database_manager(settings)
     redis_bus = RedisBusAdapter(settings.redis_url, enabled=settings.redis_enabled)
     event_broker = EventStreamBroker()
+    event_parser = EventParserAdapter()
     command_runner = CommandRunner()
     repo_inspector = RepoInspectorAdapter(command_runner)
-    session_supervisor = SessionSupervisor()
+    process_supervisor = ProcessSupervisorAdapter(
+        stop_grace_seconds=settings.session_stop_grace_seconds,
+    )
+    codex_adapter = CodexLocalAdapter(
+        process_supervisor,
+        default_simulation_mode=settings.codex_simulation_mode_default,
+        heartbeat_interval_seconds=settings.session_heartbeat_interval_seconds,
+    )
+    session_supervisor = SessionSupervisor(
+        settings=settings,
+        database=database,
+        redis_bus=redis_bus,
+        event_broker=event_broker,
+        event_parser=event_parser,
+        adapters={codex_adapter.kind: codex_adapter},
+    )
     worktree_manager = WorktreeManager(settings, command_runner)
-    orchestrator = OrchestratorService(worktree_manager, session_supervisor)
+    orchestrator = OrchestratorService(
+        settings=settings,
+        database=database,
+        redis_bus=redis_bus,
+        event_broker=event_broker,
+        worktree_manager=worktree_manager,
+        repo_inspector=repo_inspector,
+        command_runner=command_runner,
+        session_supervisor=session_supervisor,
+    )
 
     return ServiceContainer(
         settings=settings,
         database=database,
         redis_bus=redis_bus,
         event_broker=event_broker,
+        event_parser=event_parser,
         command_runner=command_runner,
         repo_inspector=repo_inspector,
+        process_supervisor=process_supervisor,
         session_supervisor=session_supervisor,
         worktree_manager=worktree_manager,
         orchestrator=orchestrator,

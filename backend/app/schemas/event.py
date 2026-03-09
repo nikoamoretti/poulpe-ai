@@ -14,16 +14,6 @@ class EventSourceRef(ORMModel):
     id: str
 
 
-class StructuredEventBlock(ORMModel):
-    event_type: str
-    level: EventLevel = EventLevel.INFO
-    summary: str | None = None
-    project_id: UUID | None = None
-    task_id: UUID | None = None
-    session_id: UUID | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 class EventCreate(ORMModel):
     category: EventCategory
     event_type: str

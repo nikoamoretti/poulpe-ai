@@ -1,11 +1,17 @@
-from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
 from app.api.deps import get_session_service, get_workspace_service
 from app.schemas.common import ApiMessage
-from app.schemas.session import SessionCreate, SessionRead
+from app.schemas.session import (
+    SessionCreate,
+    SessionMessageRequest,
+    SessionRead,
+    SessionStartRequest,
+)
+from app.schemas.structured_event import ParsedSessionEventRead
+from app.schemas.transcript import TranscriptChunkRead
 from app.schemas.workspace import WorkspaceStatusRead
 from app.services.session_service import SessionService
 from app.services.workspace_service import WorkspaceService
@@ -37,6 +43,15 @@ def get_session(
     return service.get_session(session_id)
 
 
+@router.post("/{session_id}/start", response_model=SessionRead)
+def start_session(
+    session_id: UUID,
+    payload: SessionStartRequest,
+    service: SessionService = Depends(get_session_service),
+) -> SessionRead:
+    return service.start_session(session_id, payload)
+
+
 @router.get("/{session_id}/workspace", response_model=WorkspaceStatusRead)
 def get_session_workspace(
     session_id: UUID,
@@ -53,17 +68,44 @@ def create_session_workspace(
     return service.provision_session_workspace(session_id)
 
 
+@router.post("/{session_id}/messages", response_model=ApiMessage)
+def send_session_instruction(
+    session_id: UUID,
+    payload: SessionMessageRequest,
+    service: SessionService = Depends(get_session_service),
+) -> ApiMessage:
+    return service.send_instruction(session_id, payload)
+
+
+@router.post("/{session_id}/interrupt", response_model=ApiMessage)
+def interrupt_session(
+    session_id: UUID,
+    service: SessionService = Depends(get_session_service),
+) -> ApiMessage:
+    return service.interrupt_session(session_id)
+
+
+@router.get("/{session_id}/transcript", response_model=list[TranscriptChunkRead])
+def get_session_transcript(
+    session_id: UUID,
+    limit: int = Query(default=200, ge=1, le=1000),
+    service: SessionService = Depends(get_session_service),
+) -> list[TranscriptChunkRead]:
+    return service.list_transcript(session_id, limit=limit)
+
+
+@router.get("/{session_id}/structured-events", response_model=list[ParsedSessionEventRead])
+def get_session_structured_events(
+    session_id: UUID,
+    limit: int = Query(default=200, ge=1, le=1000),
+    service: SessionService = Depends(get_session_service),
+) -> list[ParsedSessionEventRead]:
+    return service.list_structured_events(session_id, limit=limit)
+
+
 @router.post("/{session_id}/stop", response_model=ApiMessage)
 def stop_session(
     session_id: UUID,
     service: SessionService = Depends(get_session_service),
 ) -> ApiMessage:
     return service.stop_session(session_id)
-
-
-@router.get("/stub/operator-note", response_model=ApiMessage, include_in_schema=False)
-def operator_note() -> ApiMessage:
-    return ApiMessage(
-        detail="Session spawning and supervision are still stubbed in the scaffold.",
-        generated_at=datetime.now(UTC),
-    )

@@ -27,9 +27,10 @@ def upgrade() -> None:
     session_role = sa.Enum("manager", "worker", "reviewer", name="session_role", native_enum=False)
     session_status = sa.Enum(
         "pending",
-        "provisioning",
+        "starting",
         "running",
-        "exited",
+        "blocked",
+        "completed",
         "failed",
         "stopped",
         name="session_status",
@@ -58,14 +59,38 @@ def upgrade() -> None:
         name="artifact_kind",
         native_enum=False,
     )
+    transcript_stream = sa.Enum(
+        "stdin",
+        "stdout",
+        "stderr",
+        "system",
+        name="transcript_stream",
+        native_enum=False,
+    )
+    structured_event_type = sa.Enum(
+        "start",
+        "progress",
+        "question",
+        "blocked",
+        "tests_run",
+        "complete",
+        "error",
+        "heartbeat",
+        name="structured_event_type",
+        native_enum=False,
+    )
+    structured_event_status = sa.Enum(
+        "valid",
+        "malformed",
+        name="structured_event_status",
+        native_enum=False,
+    )
     review_status = sa.Enum(
         "pending",
         "running",
-        "changes_requested",
-        "reviewer_approved",
-        "human_approved",
+        "needs_changes",
+        "approved",
         "rejected",
-        "merge_ready",
         name="review_status",
         native_enum=False,
     )
@@ -92,6 +117,9 @@ def upgrade() -> None:
         session_transport,
         workspace_status,
         artifact_kind,
+        transcript_stream,
+        structured_event_type,
+        structured_event_status,
         review_status,
         event_category,
         event_level,
@@ -142,10 +170,15 @@ def upgrade() -> None:
         sa.Column("role", session_role, nullable=False),
         sa.Column("status", session_status, nullable=False),
         sa.Column("transport", session_transport, nullable=False),
+        sa.Column("adapter_kind", sa.String(length=120), nullable=False),
         sa.Column("branch_name", sa.String(length=255), nullable=True),
         sa.Column("workspace_path", sa.Text(), nullable=True),
         sa.Column("command", sa.Text(), nullable=True),
+        sa.Column("pid", sa.Integer(), nullable=True),
+        sa.Column("exit_code", sa.Integer(), nullable=True),
+        sa.Column("blocked_reason", sa.Text(), nullable=True),
         sa.Column("metadata", sa.JSON(), nullable=False),
+        sa.Column("runtime_metadata", sa.JSON(), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
@@ -158,6 +191,48 @@ def upgrade() -> None:
     )
     op.create_index("ix_sessions_project_id", "sessions", ["project_id"], unique=False)
     op.create_index("ix_sessions_task_id", "sessions", ["task_id"], unique=False)
+
+    op.create_table(
+        "transcript_chunks",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("sequence", sa.Integer(), nullable=False),
+        sa.Column("stream", transcript_stream, nullable=False),
+        sa.Column("content", sa.Text(), nullable=False),
+        sa.Column("metadata", sa.JSON(), nullable=False),
+        sa.Column("occurred_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_transcript_chunks_session_id", "transcript_chunks", ["session_id"], unique=False)
+
+    op.create_table(
+        "parsed_session_events",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("session_id", sa.Uuid(), nullable=False),
+        sa.Column("sequence", sa.Integer(), nullable=False),
+        sa.Column("transcript_sequence", sa.Integer(), nullable=True),
+        sa.Column("stream", transcript_stream, nullable=False),
+        sa.Column("status", structured_event_status, nullable=False),
+        sa.Column("event_type", structured_event_type, nullable=True),
+        sa.Column("declared_type", sa.String(length=120), nullable=True),
+        sa.Column("level", event_level, nullable=True),
+        sa.Column("summary", sa.Text(), nullable=True),
+        sa.Column("payload", sa.JSON(), nullable=False),
+        sa.Column("raw_block", sa.Text(), nullable=False),
+        sa.Column("validation_error", sa.Text(), nullable=True),
+        sa.Column("occurred_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=False),
+        sa.ForeignKeyConstraint(["session_id"], ["sessions.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        "ix_parsed_session_events_session_id",
+        "parsed_session_events",
+        ["session_id"],
+        unique=False,
+    )
 
     op.create_table(
         "workspaces",
@@ -257,6 +332,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("ix_parsed_session_events_session_id", table_name="parsed_session_events")
+    op.drop_table("parsed_session_events")
+
     op.drop_index("ix_events_sequence", table_name="events")
     op.drop_index("ix_events_session_id", table_name="events")
     op.drop_index("ix_events_task_id", table_name="events")
@@ -271,6 +349,9 @@ def downgrade() -> None:
 
     op.drop_index("ix_workspaces_project_id", table_name="workspaces")
     op.drop_table("workspaces")
+
+    op.drop_index("ix_transcript_chunks_session_id", table_name="transcript_chunks")
+    op.drop_table("transcript_chunks")
 
     op.drop_index("ix_sessions_task_id", table_name="sessions")
     op.drop_index("ix_sessions_project_id", table_name="sessions")
@@ -295,5 +376,8 @@ def downgrade() -> None:
         "session_role",
         "task_status",
         "project_status",
+        "structured_event_status",
+        "structured_event_type",
+        "transcript_stream",
     ):
         sa.Enum(name=enum_name).drop(bind, checkfirst=True)

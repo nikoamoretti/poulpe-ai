@@ -33,3 +33,18 @@ async def session_output(session_id: UUID, websocket: WebSocket) -> None:
         return
     finally:
         subscription.close()
+
+
+@websocket_router.websocket("/ws/sessions/{session_id}/events")
+async def session_events(session_id: UUID, websocket: WebSocket) -> None:
+    await websocket.accept()
+    broker = websocket.app.state.container.event_broker
+    subscription = broker.subscribe(session_id=session_id)
+    try:
+        while True:
+            event = await subscription.queue.get()
+            await websocket.send_json(event.model_dump(mode="json"))
+    except WebSocketDisconnect:
+        return
+    finally:
+        subscription.close()

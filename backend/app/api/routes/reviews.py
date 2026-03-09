@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.api.deps import get_review_service
-from app.schemas.review import ReviewCreate, ReviewDecision, ReviewRead
+from app.schemas.review import ReviewApprove, ReviewCreate, ReviewMergeReady, ReviewRead, ReviewReject
 from app.services.review_service import ReviewService
 
 router = APIRouter(prefix="/reviews", tags=["reviews"])
@@ -22,7 +22,7 @@ def create_review(
     payload: ReviewCreate,
     service: ReviewService = Depends(get_review_service),
 ) -> ReviewRead:
-    return service.request_review(payload)
+    return service.create_review(payload)
 
 
 @router.get("/{review_id}", response_model=ReviewRead)
@@ -33,10 +33,28 @@ def get_review(
     return service.get_review(review_id)
 
 
-@router.post("/{review_id}/decision", response_model=ReviewRead)
-def record_review_decision(
+@router.post("/{review_id}/approve", response_model=ReviewRead)
+def approve_review(
     review_id: UUID,
-    payload: ReviewDecision,
+    payload: ReviewApprove,
     service: ReviewService = Depends(get_review_service),
 ) -> ReviewRead:
-    return service.record_decision(review_id, payload)
+    return service.approve_review(review_id, payload)
+
+
+@router.post("/{review_id}/reject", response_model=ReviewRead)
+def reject_review(
+    review_id: UUID,
+    payload: ReviewReject,
+    service: ReviewService = Depends(get_review_service),
+) -> ReviewRead:
+    return service.reject_review(review_id, payload)
+
+
+@router.post("/{review_id}/merge-ready", response_model=ReviewRead)
+def mark_review_merge_ready(
+    review_id: UUID,
+    payload: ReviewMergeReady,
+    service: ReviewService = Depends(get_review_service),
+) -> ReviewRead:
+    return service.mark_merge_ready(review_id, payload)

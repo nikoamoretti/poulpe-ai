@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -18,6 +20,31 @@ class TaskCreate(ORMModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskAssignmentRequest(ORMModel):
+    session_id: UUID
+    allowed_paths: list[str] = Field(default_factory=list)
+    dependency_task_ids: list[UUID] = Field(default_factory=list)
+    note: str | None = None
+
+
+class TaskAssignmentRead(ORMModel):
+    task: "TaskRead"
+    assigned_session_id: UUID | None = None
+    allowed_paths: list[str] = Field(default_factory=list)
+    dependency_task_ids: list[UUID] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+
+
+class TaskBlockedRequest(ORMModel):
+    reason: str
+    note: str | None = None
+
+
+class TaskCompletedRequest(ORMModel):
+    summary: str | None = None
+    note: str | None = None
+
+
 class TaskRead(ORMModel):
     id: UUID
     project_id: UUID
@@ -30,3 +57,6 @@ class TaskRead(ORMModel):
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_json")
     created_at: datetime
     updated_at: datetime
+
+
+TaskAssignmentRead.model_rebuild()

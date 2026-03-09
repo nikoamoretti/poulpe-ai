@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.container import ServiceContainer
 from app.core.database import get_db as get_database_session
 from app.services.event_service import EventService
+from app.services.orchestration_service import OrchestratorService
 from app.services.project_service import ProjectService
 from app.services.review_service import ReviewService
 from app.services.session_service import SessionService
@@ -32,6 +33,12 @@ def get_event_service(
         redis_bus=container.redis_bus,
         event_broker=container.event_broker,
     )
+
+
+def get_orchestrator_service(
+    container: ServiceContainer = Depends(get_container),
+) -> OrchestratorService:
+    return container.orchestrator
 
 
 def get_project_service(
@@ -92,5 +99,17 @@ def get_session_service(
 def get_review_service(
     db: Session = Depends(get_db),
     event_service: EventService = Depends(get_event_service),
+    container: ServiceContainer = Depends(get_container),
 ) -> ReviewService:
-    return ReviewService(db=db, event_service=event_service)
+    workspace_service = WorkspaceService(
+        db=db,
+        event_service=event_service,
+        worktree_manager=container.worktree_manager,
+        repo_inspector=container.repo_inspector,
+        command_runner=container.command_runner,
+    )
+    return ReviewService(
+        db=db,
+        event_service=event_service,
+        workspace_service=workspace_service,
+    )

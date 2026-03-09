@@ -23,9 +23,10 @@ class SessionRole(StrEnum):
 
 class SessionStatus(StrEnum):
     PENDING = "pending"
-    PROVISIONING = "provisioning"
+    STARTING = "starting"
     RUNNING = "running"
-    EXITED = "exited"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
     FAILED = "failed"
     STOPPED = "stopped"
 
@@ -64,11 +65,9 @@ class EventCategory(StrEnum):
 class ReviewStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
-    CHANGES_REQUESTED = "changes_requested"
-    REVIEWER_APPROVED = "reviewer_approved"
-    HUMAN_APPROVED = "human_approved"
+    NEEDS_CHANGES = "needs_changes"
+    APPROVED = "approved"
     REJECTED = "rejected"
-    MERGE_READY = "merge_ready"
 
 
 class ArtifactKind(StrEnum):
@@ -80,3 +79,32 @@ class ArtifactKind(StrEnum):
     TRANSCRIPT = "transcript"
     BUNDLE = "bundle"
     NOTE = "note"
+
+
+class TranscriptStream(StrEnum):
+    STDIN = "stdin"
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    SYSTEM = "system"
+
+
+class StructuredEventType(StrEnum):
+    START = "start"
+    PROGRESS = "progress"
+    QUESTION = "question"
+    BLOCKED = "blocked"
+    TESTS_RUN = "tests_run"
+    COMPLETE = "complete"
+    ERROR = "error"
+    HEARTBEAT = "heartbeat"
+
+
+class StructuredEventStatus(StrEnum):
+    VALID = "valid"
+    MALFORMED = "malformed"
+
+
+class TestCommandStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    WARN = "warn"

@@ -1,9 +1,11 @@
 import logging
 
 
-def configure_logging() -> None:
+def configure_logging(level: str = "INFO") -> None:
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=resolved_level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
     )
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -24,6 +25,8 @@ from app.schemas.workspace import (
 from app.services.command_runner import CommandRunner
 from app.services.event_service import EventService
 from app.services.worktree_manager import WorktreeManager
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspaceService:
@@ -81,10 +84,8 @@ class WorkspaceService:
 
         workspace.status = WorkspaceStatus.PROVISIONING
         workspace.metadata_json = metadata
-        session.status = SessionStatus.PROVISIONING
         self.db.commit()
         self.db.refresh(workspace)
-        self.db.refresh(session)
 
         self.event_service.record_event(
             EventCreate(
@@ -121,7 +122,6 @@ class WorkspaceService:
         workspace.base_commit = snapshot.base_commit
         workspace.head_commit = snapshot.head_commit
         workspace.status = snapshot.status
-        session.status = SessionStatus.PENDING
         session.branch_name = snapshot.branch_name
         session.workspace_path = snapshot.workspace_path
 
@@ -149,6 +149,12 @@ class WorkspaceService:
                     "head_commit": workspace.head_commit,
                 },
             )
+        )
+        logger.info(
+            "workspace ready for session=%s branch=%s path=%s",
+            session.id,
+            workspace.branch_name,
+            workspace.workspace_path,
         )
         return self._workspace_status_read(workspace, snapshot.changed_files)
 
@@ -219,6 +225,14 @@ class WorkspaceService:
                     "timed_out": result.timed_out,
                 },
             )
+        )
+        logger.info(
+            "workspace %s ran %s command=%r returncode=%s timed_out=%s",
+            workspace.id,
+            kind,
+            payload.command,
+            result.returncode,
+            result.timed_out,
         )
 
         return WorkspaceCommandRead(
