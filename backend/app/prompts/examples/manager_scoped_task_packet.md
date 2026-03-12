@@ -1,7 +1,7 @@
 # Example Manager Task Packet
 
 Role: `manager`
-Project: `local-agent-orchestrator`
+Project: `poulpe-ai`
 Goal: `Ship a reliable structured event protocol for supervised worker sessions`
 
 Subtasks:

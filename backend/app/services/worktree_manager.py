@@ -38,18 +38,21 @@ class WorktreeManager:
         self,
         *,
         project_slug: str,
+        project_id: UUID,
         role: SessionRole,
-        task_id: UUID,
+        task_id: UUID | None,
         session_id: UUID,
         base_branch: str,
     ) -> WorkspacePlan:
+        scope_id = str(task_id) if task_id is not None else f"project-{project_id}"
+        branch_scope = str(task_id)[:8] if task_id is not None else f"project-{str(project_id)[:8]}"
         workspace_dir = (
             Path(self.settings.orchestrator_workspaces_root).expanduser().resolve()
             / project_slug
-            / str(task_id)
+            / scope_id
             / str(session_id)
         )
-        branch_name = f"orchestrator/{role.value}/{str(task_id)[:8]}/{str(session_id)[:8]}"
+        branch_name = f"orchestrator/{role.value}/{branch_scope}/{str(session_id)[:8]}"
         return WorkspacePlan(
             branch_name=branch_name,
             workspace_path=str(workspace_dir),

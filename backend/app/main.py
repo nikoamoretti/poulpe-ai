@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import suppress
 from contextlib import asynccontextmanager
 from time import perf_counter
 
@@ -27,6 +29,8 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         container = build_container(settings)
+        automation_task: asyncio.Task[None] | None = None
+        automation_stop = asyncio.Event()
         container.ensure_local_dirs()
         if settings.auto_create_schema:
             Base.metadata.create_all(container.database.engine)
@@ -46,19 +50,44 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
                 report.reason,
             )
         logger.info(
-            "orchestrator api ready on %s with repos_root=%s workspaces_root=%s",
+            "portfolio api ready on %s with repos_root=%s workspaces_root=%s",
             settings.environment,
             settings.orchestrator_repos_root,
             settings.orchestrator_workspaces_root,
         )
+
+        async def portfolio_automation_loop() -> None:
+            while not automation_stop.is_set():
+                try:
+                    await asyncio.to_thread(container.portfolio_automation.tick_all)
+                except Exception:
+                    logger.exception("portfolio automation loop iteration failed")
+                try:
+                    await asyncio.wait_for(
+                        automation_stop.wait(),
+                        timeout=settings.portfolio_automation_interval_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+        if settings.portfolio_automation_enabled:
+            automation_task = asyncio.create_task(portfolio_automation_loop())
         yield
-        logger.info("orchestrator api shutting down")
+        automation_stop.set()
+        if automation_task is not None:
+            automation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await automation_task
+        logger.info("portfolio api shutting down")
         container.shutdown()
 
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description="Local-first control plane for manager, worker, and reviewer coding sessions.",
+        description=(
+            "Portfolio-first control plane for one program manager and many independent coding-agent "
+            "projects. Legacy task-swarm APIs remain available but are no longer the primary product path."
+        ),
         lifespan=lifespan,
     )
     app.add_middleware(

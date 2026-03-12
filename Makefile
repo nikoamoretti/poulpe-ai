@@ -8,7 +8,7 @@ COMPOSE := docker compose
 .PHONY: help bootstrap install-backend install-frontend dev up down reset ps logs logs-backend logs-frontend logs-db api web migrate seed test test-backend test-frontend
 
 help:
-	@printf "\nLocal Agent Orchestrator developer commands\n\n"
+	@printf "\nPoulpe AI developer commands\n\n"
 	@printf "  make up             Build and start the full Docker Compose stack in the background\n"
 	@printf "  make dev            Build and start the full Docker Compose stack in the foreground\n"
 	@printf "  make down           Stop the Docker Compose stack\n"

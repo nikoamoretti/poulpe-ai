@@ -4,7 +4,7 @@ from app.api.deps import get_orchestrator_service
 from app.schemas.orchestrator import OrchestratorTickRead, OrchestratorTickRequest
 from app.services.orchestration_service import OrchestratorService
 
-router = APIRouter(prefix="/orchestrator", tags=["orchestrator"])
+router = APIRouter(prefix="/orchestrator", tags=["legacy-orchestrator"])
 
 
 @router.post("/tick", response_model=OrchestratorTickRead)

@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.core.enums import EventLevel, StructuredEventType
+from app.core.enums import EventLevel, StructuredEventType, TestCommandStatus
 from app.schemas.structured_event import STRUCTURED_EVENT_ADAPTER, StructuredEventPayload
 
 START_MARKER = "[[EVENT]]"
@@ -148,6 +148,17 @@ class EventParserAdapter:
         else:
             normalized["type"] = LEGACY_EVENT_TYPE_MAP.get(str(raw_type), str(raw_type))
 
+        if "payload" in normalized and isinstance(normalized["payload"], dict):
+            payload_details = normalized.pop("payload")
+            details = normalized.get("details")
+            if not isinstance(details, dict):
+                details = {}
+            normalized["details"] = {**payload_details, **details}
+            for key, value in payload_details.items():
+                normalized.setdefault(key, value)
+
+        self._lift_event_specific_fields(normalized)
+
         if not normalized.get("summary"):
             summary = normalized.get("message")
             if summary is None:
@@ -165,13 +176,82 @@ class EventParserAdapter:
                 EventLevel.INFO.value,
             )
 
-        if "payload" in normalized and isinstance(normalized["payload"], dict):
-            payload_details = normalized.pop("payload")
-            details = normalized.get("details")
-            if not isinstance(details, dict):
-                details = {}
-            normalized["details"] = {**payload_details, **details}
-            for key, value in payload_details.items():
-                normalized.setdefault(key, value)
-
         return normalized
+
+    def _lift_event_specific_fields(self, normalized: dict[str, Any]) -> None:
+        details = normalized.get("details")
+        if not isinstance(details, dict):
+            details = {}
+            normalized["details"] = details
+
+        event_type = str(normalized.get("type") or "")
+        if event_type == StructuredEventType.QUESTION.value:
+            self._setdefault_from_detail(normalized, details, "question", "question", "prompt")
+            choices = details.get("choices")
+            if isinstance(choices, list) and "choices" not in normalized:
+                normalized["choices"] = [str(choice) for choice in choices if str(choice).strip()]
+            return
+
+        if event_type == StructuredEventType.BLOCKED.value:
+            self._setdefault_from_detail(normalized, details, "reason", "reason", "blocked_reason", "need")
+            needs = details.get("needs")
+            if isinstance(needs, list) and "needs" not in normalized:
+                normalized["needs"] = [str(item) for item in needs if str(item).strip()]
+            return
+
+        if event_type == StructuredEventType.ERROR.value:
+            self._setdefault_from_detail(normalized, details, "error", "error", "message")
+            retryable = details.get("retryable")
+            if isinstance(retryable, bool) and "retryable" not in normalized:
+                normalized["retryable"] = retryable
+            return
+
+        if event_type == StructuredEventType.TESTS_RUN.value:
+            self._normalize_tests_run_event(normalized, details)
+
+    @staticmethod
+    def _setdefault_from_detail(
+        normalized: dict[str, Any],
+        details: dict[str, Any],
+        target_key: str,
+        *detail_keys: str,
+    ) -> None:
+        if normalized.get(target_key):
+            return
+        for key in detail_keys:
+            value = details.get(key)
+            if isinstance(value, str) and value.strip():
+                normalized[target_key] = value.strip()
+                return
+
+    def _normalize_tests_run_event(self, normalized: dict[str, Any], details: dict[str, Any]) -> None:
+        if not normalized.get("command"):
+            command = details.get("command")
+            if isinstance(command, str) and command.strip():
+                normalized["command"] = command.strip()
+            else:
+                checks = details.get("checks")
+                if isinstance(checks, list):
+                    rendered = [str(item).strip() for item in checks if str(item).strip()]
+                    if rendered:
+                        normalized["command"] = " && ".join(rendered)
+
+        if normalized.get("exit_code") is None:
+            exit_code = details.get("exit_code", details.get("code"))
+            if isinstance(exit_code, int):
+                normalized["exit_code"] = exit_code
+
+        status = normalized.get("status")
+        if status is None:
+            detail_status = details.get("status")
+            if isinstance(detail_status, str) and detail_status.strip():
+                normalized["status"] = detail_status.strip().lower()
+            else:
+                result_text = str(details.get("result", "")).lower()
+                if "fail" in result_text or "error" in result_text:
+                    normalized["status"] = TestCommandStatus.FAILED.value
+                else:
+                    normalized["status"] = TestCommandStatus.PASSED.value
+
+        if normalized.get("exit_code") is None:
+            normalized["exit_code"] = 1 if normalized.get("status") == TestCommandStatus.FAILED.value else 0

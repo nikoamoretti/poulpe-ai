@@ -8,11 +8,13 @@ __pycache__/
 .ruff_cache/
 .venv/
 backend/.venv/
+*.egg-info/
 
 # Node / Next.js
 node_modules/
 frontend/node_modules/
 frontend/.next/
+frontend/tsconfig.tsbuildinfo
 
 # Environment
 .env
@@ -23,7 +25,13 @@ frontend/.env.local
 coverage/
 dist/
 *.log
+dump.rdb
 
 # Local orchestrator state
+.orchestrator/
 .orchestrator/repos/
 .orchestrator/workspaces/
+backend/.orchestrator/
+
+# Temporary frontend design artifacts
+frontend/.*.png

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import sys
@@ -15,7 +16,7 @@ from app.adapters.process_supervisor import (
 from app.core.errors import ValidationError
 
 
-class CodexLocalAdapter(AgentAdapter):
+class CodexAdapter(AgentAdapter):
     kind = "codex_local"
 
     def __init__(
@@ -30,6 +31,7 @@ class CodexLocalAdapter(AgentAdapter):
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.backend_root = Path(__file__).resolve().parents[2]
         self._simulation_modes: dict[str, bool] = {}
+        self._live_input_modes: dict[str, bool] = {}
 
     def start(
         self,
@@ -45,6 +47,9 @@ class CodexLocalAdapter(AgentAdapter):
         env["ORCHESTRATOR_ROLE"] = session_config.role.value
         env["ORCHESTRATOR_WORKSPACE_PATH"] = session_config.workspace_path or ""
         env["ORCHESTRATOR_SIMULATION_MODE"] = "1" if session_config.simulation_mode else "0"
+        env["ORCHESTRATOR_SESSION_KIND"] = str(session_config.metadata.get("session_kind") or "")
+        if session_config.startup_message:
+            env["ORCHESTRATOR_STARTUP_PROMPT"] = session_config.startup_message
 
         python_path = env.get("PYTHONPATH")
         backend_root = str(self.backend_root)
@@ -58,9 +63,15 @@ class CodexLocalAdapter(AgentAdapter):
             heartbeat_interval_seconds=self.heartbeat_interval_seconds,
         )
         self._simulation_modes[session_config.session_id] = session_config.simulation_mode
+        self._live_input_modes[session_config.session_id] = bool(session_config.simulation_mode)
         return self.process_supervisor.launch(spec, callbacks=callbacks)
 
     def send(self, session_id: str, message: str) -> None:
+        if not self._live_input_modes.get(session_id, self.default_simulation_mode):
+            raise ValidationError(
+                "Real Codex exec sessions do not support live follow-up messages yet. "
+                "Start a new task or use the simulated runtime for interactive messaging."
+            )
         self.process_supervisor.send(session_id, message)
 
     def interrupt(self, session_id: str) -> None:
@@ -97,7 +108,37 @@ class CodexLocalAdapter(AgentAdapter):
                 command.extend(["--workspace-path", session_config.workspace_path])
             return command
 
-        # This is the swap point for a real Codex CLI invocation.
         if not session_config.command.strip():
             raise ValidationError("Real Codex execution requires a non-empty command.")
-        return shlex.split(session_config.command)
+        command_parts = shlex.split(session_config.command)
+        if not command_parts:
+            raise ValidationError("Real Codex execution requires a valid command.")
+        if (
+            len(command_parts) > 1
+            and command_parts[-1] == session_config.role.value
+            and not command_parts[-1].startswith("-")
+        ):
+            command_parts = command_parts[:-1]
+        if not session_config.workspace_path:
+            raise ValidationError("Real Codex execution requires a workspace path.")
+        return [
+            sys.executable,
+            "-m",
+            "app.runtime.codex_exec_worker",
+            "--session-id",
+            session_config.session_id,
+            "--role",
+            session_config.role.value,
+            "--workspace-path",
+            session_config.workspace_path,
+            "--codex-command",
+            json.dumps(command_parts),
+            *(
+                ["--model", session_config.model]
+                if session_config.model
+                else []
+            ),
+        ]
+
+
+CodexLocalAdapter = CodexAdapter

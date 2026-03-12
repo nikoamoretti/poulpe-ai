@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "local-agent-orchestrator-backend"
+name = "poulpe-ai-backend"
 version = "0.1.0"
-description = "FastAPI backend for the Local Agent Orchestrator."
+description = "FastAPI backend for Poulpe AI."
 requires-python = ">=3.11"
 dependencies = [
   "alembic>=1.14,<2.0",

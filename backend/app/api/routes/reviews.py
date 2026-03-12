@@ -6,7 +6,7 @@ from app.api.deps import get_review_service
 from app.schemas.review import ReviewApprove, ReviewCreate, ReviewMergeReady, ReviewRead, ReviewReject
 from app.services.review_service import ReviewService
 
-router = APIRouter(prefix="/reviews", tags=["reviews"])
+router = APIRouter(prefix="/reviews", tags=["legacy-reviews"])
 
 
 @router.get("", response_model=list[ReviewRead])

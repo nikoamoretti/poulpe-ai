@@ -18,6 +18,10 @@ def test_project_task_session_review_flow(client, git_repo: Path) -> None:
     assert projects_response.status_code == 200
     assert len(projects_response.json()) == 1
 
+    scope_response = client.get(f"/api/v1/projects/{project['id']}/scope-options")
+    assert scope_response.status_code == 200
+    assert scope_response.json() == ["README.md"]
+
     task_response = client.post(
         "/api/v1/tasks",
         json={

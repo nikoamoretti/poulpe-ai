@@ -45,6 +45,9 @@ def settings(tmp_path: Path) -> Settings:
         redis_enabled=False,
         startup_check_connections=False,
         auto_create_schema=True,
+        codex_runtime_command_template=str(tmp_path / ".missing-runtime" / "codex-{role}"),
+        claude_code_runtime_command_template=str(tmp_path / ".missing-runtime" / "claude-{role}"),
+        portfolio_automation_enabled=False,
         orchestrator_repos_root=tmp_path / ".orchestrator" / "repos",
         orchestrator_workspaces_root=tmp_path / ".orchestrator" / "workspaces",
     )

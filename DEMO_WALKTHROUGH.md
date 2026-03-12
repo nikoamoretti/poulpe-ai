@@ -1,6 +1,6 @@
 # Demo Walkthrough
 
-This walkthrough assumes a fresh clone and the default Docker Compose flow.
+This is the fastest way to show what v0 does to a new user.
 
 ## 1. Start the stack
 
@@ -10,127 +10,82 @@ docker compose up --build
 
 Wait for:
 - backend healthcheck to pass
-- frontend dev server to start on port `3000`
-- demo seed log lines from the backend
+- frontend to start on port `3000`
+- demo seed logs from the backend
 
-## 2. Open the operator console
+## 2. Open the app
 
 Go to `http://localhost:3000`.
 
-On a fresh database you should see:
-- one demo project
-- three tasks
-- five sessions
-- one review
-- a live project event feed
+On a fresh database, the app opens with:
+- one demo repo workspace
+- three seeded tasks
+- one approval-ready task
+- readable activity updates already visible
+- sample tasks for frontend, backend, and docs work
 
-## 3. Inspect the seeded demo state
+## 3. Explain the product in 20 seconds
 
-The seeded data is meant to show three common states at once:
-- `in_progress`: active worker task assigned to a worker session
-- `blocked`: dependency-gated task waiting on the active task
-- `review`: task with a packaged review containing diff + checks
+Use the main screen only:
+1. Enter one task.
+2. Optionally choose scope.
+3. Click `Start task`.
+4. Watch the activity timeline.
+5. Open `Review` and approve or request changes.
 
-The review panel should already show:
-- diff summary
-- changed file list
-- lint result
-- test result
-- approval controls
+That is the whole v0 story.
 
-## 4. Start a worker session
+## 4. Point out the seeded examples
 
-In the Sessions panel:
-1. Find a worker session in `pending`
-2. Click `Start`
-3. Watch the Live event feed update
+The demo workspace already shows three realistic examples:
+- Backend: `Tighten structured event handling`
+- Frontend: `Make the review screen easier to scan`
+- Docs: `Explain the approval flow clearly`
 
-What is real:
-- the session is launched as a supervised PTY subprocess
-- transcript chunks are persisted
-- structured events are parsed from session output
+These map to the sample-task buttons on the main screen.
 
-What is simulated by default:
-- the actual Codex process payload, via the local dev simulator
+## 5. Best live demo flow
 
-## 5. Create a new task
+Use this order:
 
-In the Actions panel:
-1. Enter a task title and description
-2. Click `Create task`
+1. Show the `How it works` strip at the top of the screen.
+2. Click the `Frontend polish` sample task.
+3. Point out the Scope and Execution mode options.
+4. Click `Start task`.
+5. Switch to `Active` and watch the new task appear with readable activity.
+6. Switch to `Review` and open the seeded approval item.
+7. Show changed files, checks, reviewer notes, and click `Approve` or `Request changes`.
 
-The new task appears immediately in the Tasks panel and emits project events.
+This demonstrates the full v0 flow without opening Advanced.
 
-## 6. Create a session for that task
+## 6. What the demo proves
 
-Still in the Actions panel:
-1. Choose `worker` as the role
-2. Pick the task you just created
-3. Optionally enter a command override
-4. Click `Create session`
+The default flow is real in these ways:
+- tasks are persisted
+- agents are persisted
+- worker sessions use isolated worktrees
+- activity comes from real stored events
+- approvals package diff and check data
 
-For worker sessions, the backend also provisions a git branch and linked worktree.
+What may still be simulated, depending on runtime selection:
+- the worker runtime itself
+- reviewer and manager agents
 
-## 7. Assign the task
+## 7. Inspect deeper only if asked
 
-In the Assign task form:
-1. Select the task in the Tasks list
-2. Choose the worker session
-3. Add allowed paths such as:
+If someone wants the internal details, open `Advanced` and show:
+- the active repo workspace
+- internal task and agent records
+- raw activity feed
+- approval metadata
 
-```text
-backend/app/services
-frontend/components
-```
+## 8. Useful sample tasks
 
-4. Click `Assign task`
+Frontend:
+- Make the review screen easier to scan.
 
-The orchestrator records ownership and scope in task/session metadata.
+Backend:
+- Tighten structured event handling.
 
-## 8. Create a review package
-
-In the Create review form:
-1. Pick a task
-2. Pick the worker session that owns it
-3. Optionally pick a reviewer session
-4. Optionally keep the default commands:
-
-```text
-git diff --stat
-git status --short
-```
-
-5. Click `Create review`
-
-The review panel will refresh with:
-- diff summary
-- changed files
-- lint artifact
-- test artifact
-- approval state
-
-## 9. Approve or reject the review
-
-In the Review detail panel:
-- use `Approve`, `Needs changes`, or `Reject`
-- enter a human approver and click `Mark merge-ready` after reviewer approval
-
-`merge-ready` is gated. Human approval is required before that state can be set.
-
-## 10. Inspect the backend directly
-
-Useful endpoints:
-- `http://localhost:8000/docs`
-- `http://localhost:8000/api/v1/projects`
-- `http://localhost:8000/api/v1/tasks?project_id=<project-id>`
-- `http://localhost:8000/api/v1/sessions?project_id=<project-id>`
-- `http://localhost:8000/api/v1/reviews?project_id=<project-id>`
-- `ws://localhost:8000/ws/projects/<project-id>/events`
-
-## Resetting the demo
-
-To wipe containers, database volumes, and local generated repos/worktrees:
-
-```bash
-make reset
-```
+Docs:
+- Explain the approval flow clearly.

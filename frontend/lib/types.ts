@@ -6,6 +6,18 @@ export type HealthResponse = {
 };
 
 export type ProjectStatus = "active" | "archived";
+export type ProjectCheckpointKind = "question" | "blocked" | "completion" | "error";
+export type ProjectCheckpointStatus = "open" | "resolved" | "dismissed";
+export type ProjectCheckpointResolution =
+  | "answered"
+  | "approved"
+  | "changes_requested"
+  | "dismissed";
+export type ProjectCheckpointAction =
+  | "answer"
+  | "approve"
+  | "request_changes"
+  | "dismiss";
 export type TaskStatus =
   | "pending"
   | "in_progress"
@@ -14,6 +26,7 @@ export type TaskStatus =
   | "done"
   | "canceled";
 export type SessionRole = "manager" | "worker" | "reviewer";
+export type RuntimeProvider = "auto" | "codex" | "claude_code" | "simulated" | "none";
 export type SessionStatus =
   | "pending"
   | "starting"
@@ -41,11 +54,28 @@ export type ArtifactKind =
 
 export type Project = {
   id: string;
+  portfolio_id: string | null;
   name: string;
   slug: string;
   repo_path: string;
   default_branch: string;
+  objective: string;
   status: ProjectStatus;
+  worker_session_id: string | null;
+  completion_summary: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type Portfolio = {
+  id: string;
+  name: string;
+  slug: string;
+  goal: string;
+  status: ProjectStatus;
+  manager_session_id: string | null;
+  manager_workspace_path: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -82,7 +112,8 @@ export type Task = {
 
 export type Session = {
   id: string;
-  project_id: string;
+  portfolio_id: string | null;
+  project_id: string | null;
   task_id: string | null;
   supervisor_session_id: string | null;
   role: SessionRole;
@@ -100,8 +131,39 @@ export type Session = {
   started_at: string | null;
   ended_at: string | null;
   last_heartbeat_at: string | null;
+  runtime: RuntimeSelection;
   created_at: string;
   updated_at: string;
+};
+
+export type RuntimeSelection = {
+  requested_provider: RuntimeProvider;
+  resolved_provider: RuntimeProvider;
+  configured: boolean;
+  available: boolean;
+  simulated: boolean;
+  disconnected: boolean;
+  can_start: boolean;
+  command: string | null;
+  summary: string;
+};
+
+export type RuntimeCapability = {
+  provider: RuntimeProvider;
+  label: string;
+  configured: boolean;
+  available: boolean;
+  simulated: boolean;
+  disconnected: boolean;
+  command: string | null;
+  summary: string;
+};
+
+export type RuntimeStatus = {
+  role: SessionRole;
+  selections: Record<string, RuntimeSelection>;
+  providers: RuntimeCapability[];
+  supported_real_providers: string[];
 };
 
 export type EventEnvelope = {
@@ -238,4 +300,36 @@ export type Review = {
 export type ApiMessage = {
   detail: string;
   generated_at: string | null;
+};
+
+export type CheckpointArtifact = {
+  id: string;
+  kind: ArtifactKind;
+  uri: string;
+  content_type: string;
+  size_bytes: number | null;
+  metadata: Record<string, unknown>;
+};
+
+export type ProjectCheckpoint = {
+  id: string;
+  portfolio_id: string;
+  project_id: string;
+  project_name: string;
+  project_slug: string;
+  source_session_id: string | null;
+  manager_session_id: string | null;
+  source_parsed_event_id: string | null;
+  kind: ProjectCheckpointKind;
+  status: ProjectCheckpointStatus;
+  summary: string;
+  details: Record<string, unknown>;
+  artifacts: CheckpointArtifact[];
+  resolution: ProjectCheckpointResolution | null;
+  response_message: string | null;
+  response_details: Record<string, unknown>;
+  source_occurred_at: string;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
 };

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +18,8 @@ from app.core.database import DatabaseManager
 from app.core.enums import (
     EventCategory,
     EventLevel,
+    ArtifactKind,
+    ProjectCheckpointKind,
     SessionRole,
     SessionStatus,
     SessionTransport,
@@ -25,14 +29,24 @@ from app.core.enums import (
 )
 from app.core.errors import InfrastructureError, NotFoundError, ValidationError
 from app.core.event_stream import EventStreamBroker
+from app.models.artifact import Artifact
 from app.models.parsed_session_event import ParsedSessionEvent
+from app.models.portfolio import Portfolio
 from app.models.project import Project
+from app.models.project_checkpoint import ProjectCheckpoint
 from app.models.session import Session as SessionModel
 from app.models.transcript_chunk import TranscriptChunk
+from app.models.workspace import Workspace
 from app.schemas.event import EventCreate, EventSourceRef
+from app.schemas.runtime import RuntimeSelectionRead
 from app.schemas.structured_event import ParsedSessionEventRead
 from app.schemas.transcript import TranscriptChunkRead
 from app.services.event_service import EventService
+from app.services.runtime_service import RuntimeService
+from app.services.task_packet_service import TaskPacketService
+from app.services.worktree_manager import WorktreeManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -43,6 +57,8 @@ class SessionLaunchPlan:
     notes: str
     adapter_kind: str
     simulation_mode: bool
+    runtime: RuntimeSelectionRead
+    blocked_reason: str | None = None
 
 
 class SessionSupervisor:
@@ -54,6 +70,9 @@ class SessionSupervisor:
         redis_bus: RedisBusAdapter,
         event_broker: EventStreamBroker,
         event_parser: EventParserAdapter,
+        runtime_service: RuntimeService,
+        task_packet_service: TaskPacketService,
+        worktree_manager: WorktreeManager,
         adapters: dict[str, AgentAdapter],
         default_adapter_kind: str = "codex_local",
     ) -> None:
@@ -62,9 +81,17 @@ class SessionSupervisor:
         self.redis_bus = redis_bus
         self.event_broker = event_broker
         self.event_parser = event_parser
+        self.runtime_service = runtime_service
+        self.task_packet_service = task_packet_service
+        self.worktree_manager = worktree_manager
         self.adapters = adapters
         self.default_adapter_kind = default_adapter_kind
         self._buffers: dict[tuple[str, str], str] = {}
+
+    PROVIDER_ADAPTER_MAP: dict[str, str] = {
+        "codex": "codex_local",
+        "claude_code": "claude_code_local",
+    }
 
     def plan_session(
         self,
@@ -72,29 +99,30 @@ class SessionSupervisor:
         role: SessionRole,
         command_override: str | None = None,
         adapter_kind: str | None = None,
+        runtime_preference: str | None = None,
+        allow_simulation_fallback: bool | None = None,
         simulation_mode: bool | None = None,
     ) -> SessionLaunchPlan:
-        default_commands = {
-            SessionRole.MANAGER: "codex manager",
-            SessionRole.WORKER: "codex worker",
-            SessionRole.REVIEWER: "codex reviewer",
-        }
-        resolved_adapter = adapter_kind or self.default_adapter_kind
-        resolved_simulation = (
-            self.settings.codex_simulation_mode_default
-            if simulation_mode is None
-            else simulation_mode
+        runtime_plan = self.runtime_service.resolve_launch(
+            role=role,
+            requested_provider=runtime_preference,
+            command_override=command_override,
+            simulation_mode=simulation_mode,
+            allow_simulation_fallback=allow_simulation_fallback,
+        )
+        # Pick the right adapter based on the resolved provider
+        resolved_adapter = adapter_kind or self.PROVIDER_ADAPTER_MAP.get(
+            runtime_plan.runtime.resolved_provider, self.default_adapter_kind
         )
         return SessionLaunchPlan(
             transport=SessionTransport.LOCAL_PROCESS,
-            command=command_override or default_commands[role],
-            initial_status=SessionStatus.PENDING,
-            notes=(
-                "Local PTY supervision is enabled. "
-                "Codex sessions default to the dev simulator until simulation_mode is disabled."
-            ),
+            command=runtime_plan.command,
+            initial_status=runtime_plan.initial_status,
+            notes=runtime_plan.notes,
             adapter_kind=resolved_adapter,
-            simulation_mode=resolved_simulation,
+            simulation_mode=runtime_plan.simulation_mode,
+            runtime=runtime_plan.runtime,
+            blocked_reason=runtime_plan.blocked_reason,
         )
 
     def start_session(self, session_id: UUID, *, initial_message: str | None = None) -> None:
@@ -103,21 +131,31 @@ class SessionSupervisor:
             session = db.get(SessionModel, session_id)
             if session is None:
                 raise NotFoundError(f"Session not found: {session_id}")
+            runtime = self.runtime_service.runtime_from_metadata(session.metadata_json)
+            if runtime.disconnected:
+                logger.warning(
+                    "session %s cannot start: runtime disconnected requested=%s summary=%s",
+                    session_id,
+                    runtime.requested_provider,
+                    runtime.summary,
+                )
+                raise ValidationError(runtime.summary)
             if session.status not in {SessionStatus.PENDING}:
                 raise ValidationError(
                     f"Only pending sessions can be started. Current status is {session.status.value}."
                 )
-            project = db.get(Project, session.project_id)
-            if project is None:
+            project = db.get(Project, session.project_id) if session.project_id is not None else None
+            if session.project_id is not None and project is None:
                 raise NotFoundError(f"Project not found: {session.project_id}")
 
-            cwd = session.workspace_path or project.repo_path
+            cwd = session.workspace_path or (project.repo_path if project is not None else None)
             if not cwd:
                 raise ValidationError(f"Session {session_id} has no cwd for runtime launch.")
 
             simulation_mode = bool(
                 session.metadata_json.get("simulation_mode", self.settings.codex_simulation_mode_default)
             )
+            logger_runtime = self.runtime_service.runtime_from_metadata(session.metadata_json)
             session.status = SessionStatus.STARTING
             session.started_at = datetime.now(UTC)
             session.ended_at = None
@@ -129,6 +167,7 @@ class SessionSupervisor:
                 "cwd": cwd,
                 "adapter_kind": session.adapter_kind,
                 "simulation_mode": simulation_mode,
+                "runtime_provider": logger_runtime.resolved_provider,
             }
             db.commit()
 
@@ -139,6 +178,93 @@ class SessionSupervisor:
             workspace_path = session.workspace_path
             task_id = session.task_id
             project_id = session.project_id
+            runtime_provider = logger_runtime.resolved_provider
+            runtime_simulated = logger_runtime.simulated
+
+        startup_message: str | None = None
+        post_start_message = initial_message.strip() if initial_message and initial_message.strip() else None
+        send_initial_message_after_start = bool(post_start_message)
+        session_kind = str(session_metadata.get("session_kind") or "")
+        if (
+            session_role == SessionRole.WORKER
+            and runtime_provider in ("codex", "claude_code")
+            and not runtime_simulated
+        ):
+            try:
+                if task_id is not None:
+                    startup_message = self.task_packet_service.build_worker_packet(
+                        session_id,
+                        operator_note=initial_message,
+                    )
+                else:
+                    startup_message = self.task_packet_service.build_project_packet(
+                        session_id,
+                        operator_note=initial_message,
+                    )
+            except Exception as exc:
+                self._mark_start_failed(session_id, exc)
+            send_initial_message_after_start = False
+            post_start_message = None
+        elif session_role == SessionRole.MANAGER:
+            if session_kind == "portfolio_manager_turn":
+                try:
+                    turn_packet = self.task_packet_service.build_portfolio_manager_turn_packet(session_id)
+                except Exception as exc:
+                    self._mark_start_failed(session_id, exc)
+                    raise
+                if runtime_simulated:
+                    try:
+                        post_start_message = (
+                            self.task_packet_service.build_portfolio_manager_turn_simulation_message(session_id)
+                        )
+                    except Exception as exc:
+                        self._mark_start_failed(session_id, exc)
+                        raise
+                    send_initial_message_after_start = True
+                else:
+                    startup_message = turn_packet
+                    post_start_message = None
+                    send_initial_message_after_start = False
+            elif not runtime_simulated and initial_message:
+                # Manager review sessions have a pre-built packet in metadata
+                is_review = bool(session_metadata.get("is_review"))
+                if is_review:
+                    startup_message = initial_message
+                elif session_kind == "portfolio_manager":
+                    try:
+                        startup_message = self.task_packet_service.build_portfolio_manager_packet(
+                            session_id,
+                            goal=initial_message,
+                        )
+                    except Exception as exc:
+                        self._mark_start_failed(session_id, exc)
+                        raise
+                else:
+                    try:
+                        startup_message = self.task_packet_service.build_manager_packet(
+                            session_id,
+                            goal=initial_message,
+                        )
+                    except Exception as exc:
+                        self._mark_start_failed(session_id, exc)
+                        raise
+                send_initial_message_after_start = False
+                post_start_message = None
+
+        logger.info(
+            "starting session %s role=%s runtime=%s simulated=%s cwd=%s command=%r startup_prompt=%s",
+            session_id,
+            session_role.value,
+            runtime_provider,
+            runtime_simulated,
+            cwd,
+            session_command,
+            (
+                "generated"
+                if startup_message or session_kind == "portfolio_manager_turn"
+                else ("operator" if post_start_message else "none")
+            ),
+        )
 
         adapter = self._adapter_for_session(session_id)
 
@@ -151,15 +277,56 @@ class SessionSupervisor:
                 project_id=project_id,
                 task_id=task_id,
                 session_id=session_id,
-                payload={"adapter_kind": adapter.kind},
+                payload={
+                    "adapter_kind": adapter.kind,
+                    "runtime_provider": runtime_provider,
+                    "runtime_simulated": runtime_simulated,
+                    "runtime_summary": logger_runtime.summary,
+                },
             )
         )
         self._record_transcript(
             session_id=session_id,
             stream=TranscriptStream.SYSTEM,
-            content=f"Starting session with adapter {adapter.kind}",
-            metadata={"phase": "start"},
+            content=(
+                f"Starting session with adapter {adapter.kind} "
+                f"using {runtime_provider} runtime"
+            ),
+            metadata={
+                "phase": "start",
+                "runtime_provider": runtime_provider,
+                "runtime_simulated": runtime_simulated,
+            },
         )
+        if startup_message:
+            startup_chunk = self._record_transcript(
+                session_id=session_id,
+                stream=TranscriptStream.STDIN,
+                content=startup_message,
+                metadata={
+                    "direction": "system_to_agent",
+                    "phase": "startup_packet",
+                    "generated": True,
+                    "runtime_provider": runtime_provider,
+                },
+            )
+            self._record_event(
+                EventCreate(
+                    category=EventCategory.SESSION,
+                    event_type="session.startup_packet_prepared",
+                    level=EventLevel.INFO,
+                    source=EventSourceRef(kind="service", role=session_role, id="session-supervisor"),
+                    project_id=project_id,
+                    task_id=task_id,
+                    session_id=session_id,
+                    payload={
+                        "runtime_provider": runtime_provider,
+                        "runtime_simulated": runtime_simulated,
+                        "transcript_sequence": startup_chunk.sequence,
+                        "length": len(startup_message),
+                    },
+                )
+            )
 
         config = AgentSessionConfig(
             session_id=session_id_str,
@@ -169,6 +336,7 @@ class SessionSupervisor:
             workspace_path=workspace_path,
             model=session_model,
             simulation_mode=simulation_mode,
+            startup_message=startup_message,
             metadata=session_metadata,
         )
 
@@ -205,11 +373,16 @@ class SessionSupervisor:
                 project_id=project_id,
                 task_id=task_id,
                 session_id=session_id,
-                payload={"pid": snapshot.pid, "cwd": snapshot.cwd},
+                payload={
+                    "pid": snapshot.pid,
+                    "cwd": snapshot.cwd,
+                    "runtime_provider": runtime_provider,
+                    "runtime_simulated": runtime_simulated,
+                },
             )
         )
-        if initial_message:
-            self.send(session_id, initial_message)
+        if send_initial_message_after_start and post_start_message:
+            self.send(session_id, post_start_message)
 
     def send(self, session_id: UUID, message: str) -> None:
         if not message.strip():
@@ -286,6 +459,7 @@ class SessionSupervisor:
             if session_record is None:
                 raise NotFoundError(f"Session not found: {session_id}")
             session_record.status = SessionStatus.STOPPED
+            session_record.ended_at = now
             session_record.last_heartbeat_at = now
             session_record.runtime_metadata_json = {
                 **session_record.runtime_metadata_json,
@@ -554,16 +728,25 @@ class SessionSupervisor:
                 occurred_at=occurred_at,
             )
             db.add(parsed_event)
+            db.flush()
 
             if block.is_valid and block.event is not None:
                 self._apply_structured_event_state(session_record, block)
 
+            checkpoint = self._maybe_create_project_checkpoint(
+                db=db,
+                session=session_record,
+                parsed_event=parsed_event,
+                block=block,
+            )
             project_id = session_record.project_id
             task_id = session_record.task_id
             role = session_record.role
             adapter_kind = session_record.adapter_kind
             db.commit()
             db.refresh(parsed_event)
+            if checkpoint is not None:
+                db.refresh(checkpoint)
 
             event_service = EventService(
                 db=db,
@@ -609,6 +792,25 @@ class SessionSupervisor:
                             "stream": chunk.stream.value,
                         },
                         raw_output=block.raw_block,
+                        occurred_at=occurred_at,
+                    )
+                )
+
+            if checkpoint is not None:
+                event_service.record_event(
+                    EventCreate(
+                        category=EventCategory.PROJECT,
+                        event_type="project.checkpoint_opened",
+                        level=EventLevel.INFO,
+                        source=EventSourceRef(kind="service", role=role, id="session-supervisor"),
+                        project_id=project_id,
+                        session_id=session.id,
+                        payload={
+                            "checkpoint_id": str(checkpoint.id),
+                            "portfolio_id": str(checkpoint.portfolio_id),
+                            "kind": checkpoint.kind.value,
+                            "summary": checkpoint.summary,
+                        },
                         occurred_at=occurred_at,
                     )
                 )
@@ -680,6 +882,220 @@ class SessionSupervisor:
             db.refresh(session)
             return session
 
+    def _maybe_create_project_checkpoint(
+        self,
+        *,
+        db,
+        session: SessionModel,
+        parsed_event: ParsedSessionEvent,
+        block: ParsedEventBlock,
+    ) -> ProjectCheckpoint | None:
+        if (
+            not block.is_valid
+            or block.event is None
+            or session.role != SessionRole.WORKER
+            or session.task_id is not None
+            or session.project_id is None
+            or session.portfolio_id is None
+        ):
+            return None
+
+        kind: ProjectCheckpointKind | None = None
+        if block.event.type == StructuredEventType.QUESTION:
+            kind = ProjectCheckpointKind.QUESTION
+        elif block.event.type == StructuredEventType.BLOCKED:
+            kind = ProjectCheckpointKind.BLOCKED
+        elif block.event.type == StructuredEventType.COMPLETE:
+            kind = ProjectCheckpointKind.COMPLETION
+        elif block.event.type == StructuredEventType.ERROR:
+            kind = ProjectCheckpointKind.ERROR
+
+        if kind is None:
+            return None
+
+        portfolio = db.get(Portfolio, session.portfolio_id)
+        if portfolio is None:
+            return None
+
+        details = block.event.model_dump(mode="json")
+        checkpoint = ProjectCheckpoint(
+            portfolio_id=session.portfolio_id,
+            project_id=session.project_id,
+            source_session_id=session.id,
+            manager_session_id=portfolio.manager_session_id,
+            source_parsed_event_id=parsed_event.id,
+            kind=kind,
+            summary=block.event.summary,
+            details_json=details,
+            source_occurred_at=parsed_event.occurred_at,
+        )
+        db.add(checkpoint)
+        db.flush()
+        if kind == ProjectCheckpointKind.COMPLETION:
+            checkpoint.details_json = self._build_completion_checkpoint_details(
+                db=db,
+                session=session,
+                checkpoint=checkpoint,
+                base_details=details,
+            )
+        return checkpoint
+
+    def _build_completion_checkpoint_details(
+        self,
+        *,
+        db,
+        session: SessionModel,
+        checkpoint: ProjectCheckpoint,
+        base_details: dict[str, Any],
+    ) -> dict[str, Any]:
+        details = dict(base_details)
+        review_context: dict[str, Any] = {}
+
+        project = db.get(Project, session.project_id) if session.project_id is not None else None
+        workspace = db.scalar(select(Workspace).where(Workspace.session_id == session.id))
+        if project is None or workspace is None:
+            review_context["error"] = "workspace_unavailable_for_review"
+            details["review_context"] = review_context
+            return details
+
+        try:
+            snapshot = self.worktree_manager.inspect_workspace(
+                repo_path=project.repo_path,
+                workspace_path=workspace.workspace_path,
+                base_branch=workspace.base_branch,
+                base_commit=workspace.base_commit,
+                expected_branch=workspace.branch_name,
+            )
+            workspace.head_commit = snapshot.head_commit
+            workspace.status = snapshot.status
+            diff_text = self.worktree_manager.get_diff(
+                repo_path=project.repo_path,
+                workspace_path=workspace.workspace_path,
+                base_ref=workspace.base_commit,
+            )
+            diff_summary = {
+                "summary": f"{len(snapshot.changed_files)} changed file(s)",
+                "file_count": len(snapshot.changed_files),
+                "changed_files": snapshot.changed_files,
+                "diff_preview": diff_text[:4000],
+            }
+            diff_artifact = self._create_inline_artifact(
+                db=db,
+                project_id=project.id,
+                session_id=session.id,
+                kind=ArtifactKind.DIFF,
+                uri=f"inline://checkpoints/{checkpoint.id}/diff",
+                content_type="text/x-diff",
+                metadata={
+                    "checkpoint_id": str(checkpoint.id),
+                    "workspace_id": str(workspace.id),
+                    "diff": diff_text,
+                    "summary": diff_summary,
+                    "changed_files": snapshot.changed_files,
+                },
+            )
+            review_context.update(
+                {
+                    "workspace": {
+                        "id": str(workspace.id),
+                        "branch_name": workspace.branch_name,
+                        "base_branch": workspace.base_branch,
+                        "base_commit": workspace.base_commit,
+                        "head_commit": workspace.head_commit,
+                        "workspace_path": workspace.workspace_path,
+                        "status": workspace.status.value,
+                    },
+                    "diff": {
+                        "artifact_id": str(diff_artifact.id),
+                        **diff_summary,
+                    },
+                }
+            )
+        except Exception as exc:
+            review_context["error"] = str(exc)
+
+        check_events = list(
+            reversed(
+                db.scalars(
+                    select(ParsedSessionEvent)
+                    .where(
+                        ParsedSessionEvent.session_id == session.id,
+                        ParsedSessionEvent.event_type == StructuredEventType.TESTS_RUN,
+                    )
+                    .order_by(ParsedSessionEvent.sequence.desc())
+                    .limit(5)
+                ).all()
+            )
+        )
+        if check_events:
+            checks: list[dict[str, Any]] = []
+            for check_event in check_events:
+                payload = dict(check_event.payload_json)
+                command = str(payload.get("command") or "")
+                kind = self._artifact_kind_for_check(command)
+                artifact = self._create_inline_artifact(
+                    db=db,
+                    project_id=project.id,
+                    session_id=session.id,
+                    kind=kind,
+                    uri=f"inline://checkpoints/{checkpoint.id}/{kind.value}/{check_event.sequence}",
+                    content_type="application/json",
+                    metadata={
+                        **payload,
+                        "checkpoint_id": str(checkpoint.id),
+                        "parsed_event_id": str(check_event.id),
+                    },
+                )
+                checks.append(
+                    {
+                        "artifact_id": str(artifact.id),
+                        "kind": kind.value,
+                        "command": payload.get("command"),
+                        "status": payload.get("status"),
+                        "exit_code": payload.get("exit_code"),
+                        "timed_out": bool(payload.get("timed_out", False)),
+                        "summary": payload.get("summary"),
+                        "occurred_at": check_event.occurred_at.isoformat(),
+                    }
+                )
+            review_context["checks"] = checks
+
+        details["review_context"] = review_context
+        return details
+
+    @staticmethod
+    def _artifact_kind_for_check(command: str) -> ArtifactKind:
+        lowered = command.lower()
+        if any(token in lowered for token in ("lint", "eslint", "ruff check", "biome check", "prettier --check")):
+            return ArtifactKind.LINT_REPORT
+        return ArtifactKind.TEST_REPORT
+
+    @staticmethod
+    def _create_inline_artifact(
+        *,
+        db,
+        project_id: UUID,
+        session_id: UUID | None,
+        kind: ArtifactKind,
+        uri: str,
+        content_type: str,
+        metadata: dict[str, Any],
+    ) -> Artifact:
+        rendered = json.dumps(metadata, sort_keys=True, default=str)
+        artifact = Artifact(
+            project_id=project_id,
+            task_id=None,
+            session_id=session_id,
+            kind=kind,
+            uri=uri,
+            content_type=content_type,
+            size_bytes=len(rendered.encode("utf-8")),
+            metadata_json=metadata,
+        )
+        db.add(artifact)
+        db.flush()
+        return artifact
+
     def _record_transcript(
         self,
         *,
@@ -722,6 +1138,7 @@ class SessionSupervisor:
             session = db.get(SessionModel, session_id)
             if session is None:
                 raise NotFoundError(f"Session not found: {session_id}")
+            runtime = self.runtime_service.runtime_from_metadata(session.metadata_json)
             session.status = SessionStatus.FAILED
             session.ended_at = datetime.now(UTC)
             session.runtime_metadata_json = {
@@ -738,7 +1155,11 @@ class SessionSupervisor:
             session_id=session_id,
             stream=TranscriptStream.SYSTEM,
             content=f"Session failed to start: {detail}",
-            metadata={"phase": "start_error"},
+            metadata={
+                "phase": "start_error",
+                "runtime_provider": runtime.resolved_provider,
+                "runtime_simulated": runtime.simulated,
+            },
         )
         self._record_event(
             EventCreate(
@@ -749,7 +1170,11 @@ class SessionSupervisor:
                 project_id=project_id,
                 task_id=task_id,
                 session_id=session_id,
-                payload={"reason": detail},
+                payload={
+                    "reason": detail,
+                    "runtime_provider": runtime.resolved_provider,
+                    "runtime_simulated": runtime.simulated,
+                },
             )
         )
 

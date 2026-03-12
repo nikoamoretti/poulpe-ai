@@ -36,12 +36,26 @@ def test_demo_seed_is_idempotent(settings) -> None:
         tasks = client.get("/api/v1/tasks", params={"project_id": project["id"]}).json()
         sessions = client.get("/api/v1/sessions", params={"project_id": project["id"]}).json()
         reviews = client.get("/api/v1/reviews", params={"project_id": project["id"]}).json()
+        events = client.get("/api/v1/events", params={"project_id": project["id"]}).json()
 
     assert len(tasks) == 3
     assert len(sessions) == 5
     assert len(reviews) == 1
     assert {task["status"] for task in tasks} == {"in_progress", "review", "blocked"}
+    assert {
+        task["title"]
+        for task in tasks
+    } == {
+        "Tighten structured event handling",
+        "Make the review screen easier to scan",
+        "Explain the approval flow clearly",
+    }
     assert reviews[0]["diff"]["changed_files"] == ["frontend/components/ReviewPanel.tsx"]
+    assert project["metadata"]["seeded_demo"] is True
+    assert len(project["metadata"]["demo"]["sample_tasks"]) == 3
+    assert any(event["event_type"] == "session.progress" for event in events)
+    assert any(event["event_type"] == "session.tests_run" for event in events)
+    assert any(event["event_type"] == "review.created" for event in events)
 
 
 def test_app_startup_can_auto_seed_demo_data(settings) -> None:

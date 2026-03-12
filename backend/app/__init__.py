@@ -1,1 +1,1 @@
-"""Local Agent Orchestrator backend application package."""
+"""Poulpe AI backend application package."""

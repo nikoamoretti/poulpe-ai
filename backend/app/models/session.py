@@ -15,8 +15,13 @@ class Session(Base):
     __tablename__ = "sessions"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True, nullable=False
+    portfolio_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("portfolios.id", ondelete="SET NULL"),
+        index=True,
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
     task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("tasks.id", ondelete="SET NULL"))
     supervisor_session_id: Mapped[uuid.UUID | None] = mapped_column(

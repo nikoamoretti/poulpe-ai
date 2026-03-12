@@ -108,3 +108,30 @@ class TestCommandStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     WARN = "warn"
+
+
+class ProjectCheckpointKind(StrEnum):
+    QUESTION = "question"
+    BLOCKED = "blocked"
+    COMPLETION = "completion"
+    ERROR = "error"
+
+
+class ProjectCheckpointStatus(StrEnum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
+
+
+class ProjectCheckpointResolution(StrEnum):
+    ANSWERED = "answered"
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+    DISMISSED = "dismissed"
+
+
+class ProjectCheckpointAction(StrEnum):
+    ANSWER = "answer"
+    APPROVE = "approve"
+    REQUEST_CHANGES = "request_changes"
+    DISMISS = "dismiss"

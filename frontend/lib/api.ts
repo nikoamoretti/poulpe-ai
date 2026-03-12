@@ -2,17 +2,26 @@ import type {
   ApiMessage,
   EventEnvelope,
   HealthResponse,
+  Portfolio,
   Project,
+  ProjectCheckpoint,
+  ProjectCheckpointAction,
   Review,
+  RuntimeStatus,
   Session,
   SessionRole,
   Task,
 } from "@/lib/types";
 
+const fallbackApiBaseUrl =
+  typeof window === "undefined"
+    ? "http://127.0.0.1:8001"
+    : `${window.location.protocol}//${window.location.hostname}:8001`;
+
 const apiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL ??
   process.env.INTERNAL_API_BASE_URL ??
-  "http://localhost:8000";
+  fallbackApiBaseUrl;
 
 export class ApiError extends Error {
   status: number;
@@ -43,14 +52,22 @@ function buildUrl(path: string, query?: RequestOptions["query"]): string {
 
 async function requestJson<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { query, headers, ...init } = options;
-  const response = await fetch(buildUrl(path, query), {
-    ...init,
-    cache: init.method && init.method !== "GET" ? "no-store" : "no-store",
-    headers: {
-      "Content-Type": "application/json",
-      ...headers,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(buildUrl(path, query), {
+      ...init,
+      cache: init.method && init.method !== "GET" ? "no-store" : "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        ...headers,
+      },
+    });
+  } catch {
+    throw new ApiError(
+      `Unable to reach the API at ${apiBaseUrl}. Check that the backend is running and that CORS allows this frontend origin.`,
+      0,
+    );
+  }
 
   if (!response.ok) {
     let message = `Request failed with status ${response.status}`;
@@ -92,8 +109,113 @@ export function getProjectEventsWebSocketUrl(projectId: string): string {
   return url.toString();
 }
 
-export async function listProjects(): Promise<Project[]> {
-  return requestJson<Project[]>("/api/v1/projects");
+export async function listPortfolios(): Promise<Portfolio[]> {
+  return requestJson<Portfolio[]>("/api/v1/portfolios");
+}
+
+export async function createPortfolio(input: {
+  name: string;
+  goal: string;
+  metadata?: Record<string, unknown>;
+}): Promise<Portfolio> {
+  return requestJson<Portfolio>("/api/v1/portfolios", {
+    method: "POST",
+    body: JSON.stringify({
+      name: input.name,
+      goal: input.goal,
+      metadata: input.metadata ?? {},
+    }),
+  });
+}
+
+export async function startPortfolioManager(input: {
+  portfolioId: string;
+  runtimePreference?: string | null;
+  allowSimulationFallback?: boolean | null;
+  simulationMode?: boolean | null;
+  model?: string | null;
+  initialMessage?: string | null;
+  metadata?: Record<string, unknown>;
+}): Promise<Session> {
+  return requestJson<Session>(`/api/v1/portfolios/${input.portfolioId}/manager/start`, {
+    method: "POST",
+    body: JSON.stringify({
+      runtime_preference: input.runtimePreference ?? null,
+      allow_simulation_fallback: input.allowSimulationFallback ?? null,
+      simulation_mode: input.simulationMode ?? null,
+      model: input.model ?? null,
+      initial_message: input.initialMessage ?? null,
+      metadata: input.metadata ?? {},
+    }),
+  });
+}
+
+export async function listPortfolioInbox(
+  portfolioId: string,
+  status: "open" | "resolved" | "dismissed" | "all" = "open",
+): Promise<ProjectCheckpoint[]> {
+  return requestJson<ProjectCheckpoint[]>(`/api/v1/portfolios/${portfolioId}/inbox`, {
+    query: { status: status === "all" ? null : status },
+  });
+}
+
+export async function respondToPortfolioCheckpoint(input: {
+  portfolioId: string;
+  checkpointId: string;
+  action: ProjectCheckpointAction;
+  message?: string | null;
+  details?: Record<string, unknown>;
+}): Promise<ProjectCheckpoint> {
+  return requestJson<ProjectCheckpoint>(
+    `/api/v1/portfolios/${input.portfolioId}/inbox/${input.checkpointId}/respond`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: input.action,
+        message: input.message ?? null,
+        details: input.details ?? {},
+      }),
+    },
+  );
+}
+
+export async function listProjects(portfolioId?: string | null): Promise<Project[]> {
+  return requestJson<Project[]>("/api/v1/projects", {
+    query: { portfolio_id: portfolioId ?? null },
+  });
+}
+
+export async function createProject(input: {
+  portfolioId?: string | null;
+  name: string;
+  repoPath?: string | null;
+  createRepo?: boolean;
+  defaultBranch?: string | null;
+  objective: string;
+  metadata?: Record<string, unknown>;
+}): Promise<Project> {
+  return requestJson<Project>("/api/v1/projects", {
+    method: "POST",
+    body: JSON.stringify({
+      portfolio_id: input.portfolioId ?? null,
+      name: input.name,
+      repo_path: input.repoPath ?? null,
+      create_repo: input.createRepo ?? false,
+      default_branch: input.defaultBranch ?? null,
+      objective: input.objective,
+      metadata: input.metadata ?? {},
+    }),
+  });
+}
+
+export async function getRuntimeStatus(role: SessionRole = "worker"): Promise<RuntimeStatus> {
+  return requestJson<RuntimeStatus>("/api/v1/runtime", {
+    query: { role },
+  });
+}
+
+export async function listScopeOptions(projectId: string): Promise<string[]> {
+  return requestJson<string[]>(`/api/v1/projects/${projectId}/scope-options`);
 }
 
 export async function listTasks(projectId: string): Promise<Task[]> {
@@ -105,6 +227,7 @@ export async function createTask(input: {
   title: string;
   description: string;
   acceptance_criteria?: string[];
+  metadata?: Record<string, unknown>;
 }): Promise<Task> {
   return requestJson<Task>("/api/v1/tasks", {
     method: "POST",
@@ -113,6 +236,7 @@ export async function createTask(input: {
       title: input.title,
       description: input.description,
       acceptance_criteria: input.acceptance_criteria ?? [],
+      metadata: input.metadata ?? {},
     }),
   });
 }
@@ -121,12 +245,20 @@ export async function listSessions(projectId: string): Promise<Session[]> {
   return requestJson<Session[]>("/api/v1/sessions", { query: { project_id: projectId } });
 }
 
+export async function getSession(sessionId: string): Promise<Session> {
+  return requestJson<Session>(`/api/v1/sessions/${sessionId}`);
+}
+
 export async function createSession(input: {
   projectId: string;
   role: SessionRole;
   taskId?: string | null;
   commandOverride?: string;
+  runtimePreference?: string;
+  allowSimulationFallback?: boolean;
   simulationMode?: boolean;
+  model?: string;
+  metadata?: Record<string, unknown>;
 }): Promise<Session> {
   return requestJson<Session>("/api/v1/sessions", {
     method: "POST",
@@ -135,15 +267,70 @@ export async function createSession(input: {
       role: input.role,
       task_id: input.taskId ?? null,
       command_override: input.commandOverride || null,
-      simulation_mode: input.simulationMode ?? true,
+      runtime_preference: input.runtimePreference ?? null,
+      allow_simulation_fallback: input.allowSimulationFallback ?? null,
+      simulation_mode: input.simulationMode ?? null,
+      model: input.model ?? null,
+      metadata: input.metadata ?? {},
     }),
   });
 }
 
-export async function startSession(sessionId: string): Promise<Session> {
+export async function startSession(
+  sessionId: string,
+  initialMessage?: string,
+): Promise<Session> {
   return requestJson<Session>(`/api/v1/sessions/${sessionId}/start`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({
+      initial_message: initialMessage ?? null,
+    }),
+  });
+}
+
+export async function startProjectExecution(input: {
+  projectId: string;
+  runtimePreference?: string | null;
+  allowSimulationFallback?: boolean | null;
+  simulationMode?: boolean | null;
+  model?: string | null;
+  initialMessage?: string | null;
+  metadata?: Record<string, unknown>;
+}): Promise<Session> {
+  return requestJson<Session>(`/api/v1/projects/${input.projectId}/start`, {
+    method: "POST",
+    body: JSON.stringify({
+      runtime_preference: input.runtimePreference ?? null,
+      allow_simulation_fallback: input.allowSimulationFallback ?? null,
+      simulation_mode: input.simulationMode ?? null,
+      model: input.model ?? null,
+      initial_message: input.initialMessage ?? null,
+      metadata: input.metadata ?? {},
+    }),
+  });
+}
+
+export async function sendProjectManagerInstruction(input: {
+  projectId: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+}): Promise<Session> {
+  return requestJson<Session>(`/api/v1/projects/${input.projectId}/manager-instructions`, {
+    method: "POST",
+    body: JSON.stringify({
+      message: input.message,
+      metadata: input.metadata ?? {},
+    }),
+  });
+}
+
+export async function sendInstruction(
+  sessionId: string,
+  message: string,
+): Promise<ApiMessage> {
+  return requestJson<ApiMessage>(`/api/v1/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ message }),
   });
 }
 
@@ -243,5 +430,28 @@ export async function markReviewMergeReady(input: {
 export async function listProjectEvents(projectId: string, limit = 60): Promise<EventEnvelope[]> {
   return requestJson<EventEnvelope[]>("/api/v1/events", {
     query: { project_id: projectId, limit },
+  });
+}
+
+export async function triggerOrchestratorTick(projectId: string): Promise<{
+  started_at: string;
+  completed_at: string;
+  projects: Array<{
+    project_id: string;
+    processed_event_count: number;
+    last_event_sequence: number;
+    actions: Array<{
+      kind: string;
+      project_id: string;
+      task_id: string | null;
+      session_id: string | null;
+      detail: string;
+      payload: Record<string, unknown>;
+    }>;
+  }>;
+}> {
+  return requestJson("/api/v1/orchestrator/tick", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId }),
   });
 }

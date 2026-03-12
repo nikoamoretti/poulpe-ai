@@ -16,6 +16,7 @@ class AgentSessionConfig:
     workspace_path: str | None = None
     model: str | None = None
     simulation_mode: bool = True
+    startup_message: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 

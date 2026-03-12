@@ -25,6 +25,7 @@ from app.schemas.session import (
 from app.schemas.structured_event import ParsedSessionEventRead
 from app.schemas.transcript import TranscriptChunkRead
 from app.services.event_service import EventService
+from app.services.runtime_service import RuntimeService
 from app.services.session_supervisor import SessionSupervisor
 from app.services.worktree_manager import WorktreeManager
 from app.services.workspace_service import WorkspaceService
@@ -40,6 +41,7 @@ class SessionService:
         session_supervisor: SessionSupervisor,
         worktree_manager: WorktreeManager,
         repo_inspector: RepoInspectorAdapter,
+        runtime_service: RuntimeService,
         workspace_service: WorkspaceService,
     ) -> None:
         self.db = db
@@ -47,6 +49,7 @@ class SessionService:
         self.session_supervisor = session_supervisor
         self.worktree_manager = worktree_manager
         self.repo_inspector = repo_inspector
+        self.runtime_service = runtime_service
         self.workspace_service = workspace_service
 
     def list_sessions(self, project_id: UUID | None = None) -> list[SessionRead]:
@@ -55,7 +58,7 @@ class SessionService:
         if project_id is not None:
             stmt = stmt.where(SessionModel.project_id == project_id)
         records = self.db.scalars(stmt).all()
-        return [SessionRead.model_validate(record) for record in records]
+        return [self._to_read(record) for record in records]
 
     def get_session(self, session_id: UUID) -> SessionRead:
         self.session_supervisor.refresh_session_runtime(session_id)
@@ -63,7 +66,7 @@ class SessionService:
         session = self.db.get(SessionModel, session_id)
         if session is None:
             raise NotFoundError(f"Session not found: {session_id}")
-        return SessionRead.model_validate(session)
+        return self._to_read(session)
 
     def create_session(self, payload: SessionCreate) -> SessionRead:
         project = self.db.get(Project, payload.project_id)
@@ -85,6 +88,10 @@ class SessionService:
             role=payload.role,
             command_override=payload.command_override,
             adapter_kind=payload.adapter_kind,
+            runtime_preference=payload.runtime_preference
+            or str(payload.metadata.get("preferred_engine", "") or "")
+            or None,
+            allow_simulation_fallback=payload.allow_simulation_fallback,
             simulation_mode=payload.simulation_mode,
         )
         metadata = dict(payload.metadata)
@@ -92,6 +99,7 @@ class SessionService:
             metadata["model"] = payload.model
         metadata["simulation_mode"] = launch_plan.simulation_mode
         metadata["launch_notes"] = launch_plan.notes
+        metadata["runtime"] = launch_plan.runtime.model_dump(mode="json")
 
         session = SessionModel(
             project_id=payload.project_id,
@@ -102,6 +110,7 @@ class SessionService:
             transport=launch_plan.transport,
             adapter_kind=launch_plan.adapter_kind,
             command=launch_plan.command,
+            blocked_reason=launch_plan.blocked_reason,
             metadata_json=metadata,
             runtime_metadata_json={},
         )
@@ -112,6 +121,7 @@ class SessionService:
             repo_info = self.repo_inspector.inspect(project.repo_path, project.default_branch)
             workspace_plan = self.worktree_manager.plan_workspace(
                 project_slug=project.slug,
+                project_id=project.id,
                 role=payload.role,
                 task_id=task.id,
                 session_id=session.id,
@@ -138,6 +148,10 @@ class SessionService:
             session.branch_name = workspace.branch_name
             session.workspace_path = workspace.workspace_path
 
+        # Manager/reviewer sessions use the project repo as their working directory
+        if payload.role in (SessionRole.MANAGER, SessionRole.REVIEWER) and not session.workspace_path:
+            session.workspace_path = project.repo_path
+
         self.db.commit()
         self.db.refresh(session)
 
@@ -154,6 +168,9 @@ class SessionService:
                     "role": session.role.value,
                     "status": session.status.value,
                     "transport": session.transport.value,
+                    "runtime_provider": launch_plan.runtime.resolved_provider,
+                    "runtime_simulated": launch_plan.runtime.simulated,
+                    "runtime_disconnected": launch_plan.runtime.disconnected,
                 },
             )
         )
@@ -177,19 +194,29 @@ class SessionService:
             self.workspace_service.provision_session_workspace(session.id)
             self.db.refresh(session)
         logger.info(
-            "created %s session %s for project=%s task=%s adapter=%s",
+            "created %s session %s for project=%s task=%s adapter=%s runtime=%s simulated=%s disconnected=%s",
             session.role.value,
             session.id,
             session.project_id,
             session.task_id,
             session.adapter_kind,
+            launch_plan.runtime.resolved_provider,
+            launch_plan.runtime.simulated,
+            launch_plan.runtime.disconnected,
         )
-        return SessionRead.model_validate(session)
+        return self._to_read(session)
 
     def start_session(self, session_id: UUID, payload: SessionStartRequest) -> SessionRead:
         self.session_supervisor.start_session(session_id, initial_message=payload.initial_message)
-        logger.info("start requested for session %s", session_id)
-        return self.get_session(session_id)
+        session = self.get_session(session_id)
+        logger.info(
+            "start requested for session %s runtime=%s simulated=%s disconnected=%s",
+            session_id,
+            session.runtime.resolved_provider,
+            session.runtime.simulated,
+            session.runtime.disconnected,
+        )
+        return session
 
     def send_instruction(self, session_id: UUID, payload: SessionMessageRequest) -> ApiMessage:
         self.session_supervisor.send(session_id, payload.message)
@@ -229,3 +256,8 @@ class SessionService:
             detail=f"Stop requested for session {session_id}.",
             generated_at=datetime.now(UTC),
         )
+
+    def _to_read(self, session: SessionModel) -> SessionRead:
+        payload = SessionRead.model_validate(session).model_dump(mode="python")
+        payload["runtime"] = self.runtime_service.runtime_from_metadata(session.metadata_json)
+        return SessionRead.model_validate(payload)

@@ -1,7 +1,7 @@
 # Example Worker Task Packet
 
 Role: `worker`
-Project: `local-agent-orchestrator`
+Project: `poulpe-ai`
 Task Title: `Implement structured event extraction for worker output`
 
 Scope:

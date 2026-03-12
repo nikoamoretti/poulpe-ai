@@ -1,7 +1,7 @@
 # Example Reviewer Task Packet
 
 Role: `reviewer`
-Project: `local-agent-orchestrator`
+Project: `poulpe-ai`
 Task Title: `Review structured event protocol implementation`
 
 Review Inputs:

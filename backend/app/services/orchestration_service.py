@@ -16,6 +16,7 @@ from app.core.enums import (
     EventCategory,
     EventLevel,
     ProjectStatus,
+    ReviewStatus,
     SessionRole,
     SessionStatus,
     TaskStatus,
@@ -36,6 +37,7 @@ from app.schemas.orchestrator import (
     OrchestratorTickRead,
 )
 from app.schemas.review import ReviewCreate
+from app.schemas.session import SessionCreate
 from app.schemas.task import (
     TaskAssignmentRead,
     TaskAssignmentRequest,
@@ -43,6 +45,7 @@ from app.schemas.task import (
     TaskCompletedRequest,
     TaskRead,
 )
+from app.services.runtime_service import RuntimeService
 from app.services.event_service import EventService
 from app.services.review_service import ReviewService
 from app.services.command_runner import CommandRunner
@@ -87,6 +90,7 @@ class OrchestratorService:
         repo_inspector: RepoInspectorAdapter,
         command_runner: CommandRunner,
         session_supervisor: SessionSupervisor,
+        runtime_service: RuntimeService | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
@@ -96,6 +100,7 @@ class OrchestratorService:
         self.repo_inspector = repo_inspector
         self.command_runner = command_runner
         self.session_supervisor = session_supervisor
+        self.runtime_service = runtime_service
 
     def describe_flow(self) -> list[str]:
         return [
@@ -374,6 +379,79 @@ class OrchestratorService:
                     actions.append(action)
                     self._emit_action_event(event_service, action)
 
+            # Process manager plan events → auto-create child tasks + workers
+            plan_actions = self._process_manager_plans(
+                db=db,
+                event_service=event_service,
+                workspace_service=workspace_service,
+                project=project,
+                sessions=sessions,
+                new_events=list(new_events),
+            )
+            actions.extend(plan_actions)
+
+            # Refresh tasks + sessions after plan processing (new children may have been created)
+            if plan_actions:
+                db.flush()
+                tasks = db.scalars(select(Task).where(Task.project_id == project_id)).all()
+                sessions = db.scalars(select(SessionModel).where(SessionModel.project_id == project_id)).all()
+
+            # Auto-retry failed workers (create new worker, re-assign, start)
+            retry_actions = self._retry_failed_workers(
+                db=db,
+                event_service=event_service,
+                workspace_service=workspace_service,
+                project=project,
+                tasks=tasks,
+                sessions=sessions,
+            )
+            actions.extend(retry_actions)
+
+            # Auto-complete parent tasks when all children are done
+            completion_actions = self._complete_parent_tasks(
+                db=db,
+                event_service=event_service,
+                tasks=tasks,
+            )
+            actions.extend(completion_actions)
+
+            # Auto-start unblocked workers whose dependencies just resolved
+            start_actions = self._start_unblocked_workers(
+                db=db,
+                event_service=event_service,
+                workspace_service=workspace_service,
+                tasks=tasks,
+                sessions=sessions,
+            )
+            actions.extend(start_actions)
+
+            # Launch manager review sessions for completed workers
+            review_launch_actions = self._launch_manager_reviews(
+                db=db,
+                event_service=event_service,
+                workspace_service=workspace_service,
+                project=project,
+                tasks=tasks,
+                sessions=sessions,
+            )
+            actions.extend(review_launch_actions)
+
+            # Process completed manager reviews (approve or request changes)
+            # Refresh tasks/sessions if reviews were launched
+            if review_launch_actions:
+                db.flush()
+                tasks = db.scalars(select(Task).where(Task.project_id == project_id)).all()
+                sessions = db.scalars(select(SessionModel).where(SessionModel.project_id == project_id)).all()
+            review_result_actions = self._process_manager_review_results(
+                db=db,
+                event_service=event_service,
+                workspace_service=workspace_service,
+                project=project,
+                tasks=tasks,
+                sessions=sessions,
+            )
+            actions.extend(review_result_actions)
+
             highest_sequence = max([last_sequence, *[event.sequence for event in new_events]], default=last_sequence)
             project_orchestration["last_event_sequence"] = highest_sequence
             project_metadata["orchestrator"] = project_orchestration
@@ -397,6 +475,842 @@ class OrchestratorService:
             last_event_sequence=highest_sequence,
             actions=actions,
         )
+
+    def _process_manager_plans(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        workspace_service: WorkspaceService,
+        project: Project,
+        sessions: list[SessionModel],
+        new_events: list[Event],
+    ) -> list[OrchestratorActionRead]:
+        """Read plan events from manager sessions and auto-create child tasks + workers."""
+        actions: list[OrchestratorActionRead] = []
+        manager_session_ids = {s.id for s in sessions if s.role == SessionRole.MANAGER}
+        if not manager_session_ids:
+            return actions
+
+        for event in new_events:
+            if event.session_id not in manager_session_ids:
+                continue
+            if event.event_type != "session.progress":
+                continue
+            payload = event.payload or {}
+            details = payload.get("details") or {}
+            plan = details.get("plan")
+            if not isinstance(plan, dict):
+                continue
+            plan_tasks = plan.get("tasks")
+            if not isinstance(plan_tasks, list) or not plan_tasks:
+                continue
+
+            # Find the parent task (goal) linked to the manager session
+            manager_session = db.get(SessionModel, event.session_id)
+            parent_task_id = manager_session.task_id if manager_session else None
+
+            # Check if we already processed this plan (idempotency)
+            manager_meta = dict(manager_session.metadata_json) if manager_session else {}
+            manager_orch = dict(manager_meta.get("orchestrator", {}))
+            if str(event.id) in manager_orch.get("processed_plan_event_ids", []):
+                continue
+
+            logger.info(
+                "processing manager plan event %s with %d tasks for project %s",
+                event.id, len(plan_tasks), project.id,
+            )
+
+            # Build index for depends_on resolution
+            created_task_ids: list[UUID] = []
+
+            for idx, plan_task in enumerate(plan_tasks):
+                if not isinstance(plan_task, dict):
+                    continue
+                title = str(plan_task.get("title", "")).strip()
+                if not title:
+                    continue
+                description = str(plan_task.get("description", "")).strip() or title
+                scope = plan_task.get("scope", [])
+                if not isinstance(scope, list):
+                    scope = []
+                acceptance_criteria = plan_task.get("acceptance_criteria", [])
+                if not isinstance(acceptance_criteria, list):
+                    acceptance_criteria = []
+                priority = int(plan_task.get("priority", idx + 1))
+
+                # Resolve depends_on_index to task IDs
+                depends_on_indices = plan_task.get("depends_on_index", [])
+                if not isinstance(depends_on_indices, list):
+                    depends_on_indices = []
+                dependency_task_ids = []
+                for dep_idx in depends_on_indices:
+                    if isinstance(dep_idx, int) and 0 <= dep_idx < len(created_task_ids):
+                        dependency_task_ids.append(created_task_ids[dep_idx])
+
+                # Create the child task
+                child_task = Task(
+                    project_id=project.id,
+                    parent_task_id=parent_task_id,
+                    title=title[:200],
+                    description=description,
+                    status=TaskStatus.PENDING,
+                    priority=priority,
+                    acceptance_criteria=[str(c) for c in acceptance_criteria if c],
+                    metadata_json={
+                        "request": {"scope": [str(s) for s in scope if s], "engine": "auto"},
+                        "created_by": "manager_plan",
+                        "plan_event_id": str(event.id),
+                    },
+                )
+                db.add(child_task)
+                db.flush()  # get the ID
+                created_task_ids.append(child_task.id)
+
+                event_service.record_event(
+                    EventCreate(
+                        category=EventCategory.TASK,
+                        event_type="task.created",
+                        level=EventLevel.INFO,
+                        source=EventSourceRef(kind="service", role=SessionRole.MANAGER, id="orchestrator.plan"),
+                        project_id=project.id,
+                        task_id=child_task.id,
+                        session_id=event.session_id,
+                        payload={"title": title, "priority": priority, "parent_task_id": str(parent_task_id) if parent_task_id else None},
+                    )
+                )
+                actions.append(
+                    OrchestratorActionRead(
+                        kind="task_created_from_plan",
+                        project_id=project.id,
+                        task_id=child_task.id,
+                        session_id=event.session_id,
+                        detail=f"Manager created task: {title}",
+                        payload={"parent_task_id": str(parent_task_id) if parent_task_id else None},
+                    )
+                )
+
+            # Now create worker sessions, assign tasks, and start them
+            for idx, child_task_id in enumerate(created_task_ids):
+                child_task = db.get(Task, child_task_id)
+                if child_task is None:
+                    continue
+                plan_task = plan_tasks[idx] if idx < len(plan_tasks) else {}
+                scope = plan_task.get("scope", []) if isinstance(plan_task, dict) else []
+                if not isinstance(scope, list):
+                    scope = []
+
+                # Resolve dependency IDs
+                depends_on_indices = plan_task.get("depends_on_index", []) if isinstance(plan_task, dict) else []
+                if not isinstance(depends_on_indices, list):
+                    depends_on_indices = []
+                dep_ids = []
+                for dep_idx in depends_on_indices:
+                    if isinstance(dep_idx, int) and 0 <= dep_idx < len(created_task_ids):
+                        dep_ids.append(created_task_ids[dep_idx])
+
+                # Create worker session
+                launch_plan = self.session_supervisor.plan_session(
+                    role=SessionRole.WORKER,
+                    runtime_preference="auto",
+                    allow_simulation_fallback=True,
+                )
+                worker_meta = {
+                    "preferred_engine": "auto",
+                    "created_from": "manager_plan",
+                    "simulation_mode": launch_plan.simulation_mode,
+                    "launch_notes": launch_plan.notes,
+                    "runtime": launch_plan.runtime.model_dump(mode="json"),
+                }
+
+                worker_session = SessionModel(
+                    project_id=project.id,
+                    task_id=child_task.id,
+                    supervisor_session_id=event.session_id,
+                    role=SessionRole.WORKER,
+                    status=launch_plan.initial_status,
+                    transport=launch_plan.transport,
+                    adapter_kind=launch_plan.adapter_kind,
+                    command=launch_plan.command,
+                    blocked_reason=launch_plan.blocked_reason,
+                    metadata_json=worker_meta,
+                    runtime_metadata_json={},
+                )
+                db.add(worker_session)
+                db.flush()
+
+                # Provision workspace for the worker
+                repo_info = self.repo_inspector.inspect(project.repo_path, project.default_branch)
+                workspace_plan = self.worktree_manager.plan_workspace(
+                    project_slug=project.slug,
+                    project_id=project.id,
+                    role=SessionRole.WORKER,
+                    task_id=child_task.id,
+                    session_id=worker_session.id,
+                    base_branch=project.default_branch,
+                )
+                workspace = Workspace(
+                    project_id=project.id,
+                    session_id=worker_session.id,
+                    branch_name=workspace_plan.branch_name,
+                    base_branch=workspace_plan.base_branch,
+                    base_commit=repo_info.current_commit or "",
+                    head_commit=repo_info.current_commit,
+                    workspace_path=workspace_plan.workspace_path,
+                    status=workspace_plan.status,
+                    metadata_json={
+                        "ownership": {
+                            "session_id": str(worker_session.id),
+                            "path_lock_owner": str(worker_session.id),
+                            "path_locks": [],
+                        }
+                    },
+                )
+                db.add(workspace)
+                worker_session.branch_name = workspace.branch_name
+                worker_session.workspace_path = workspace.workspace_path
+                db.flush()
+
+                # Assign task to worker
+                allowed_paths = [str(s).strip() for s in scope if str(s).strip()]
+                task_metadata = dict(child_task.metadata_json)
+                orchestration = self._task_orchestration(task_metadata)
+                orchestration.update({
+                    "assigned_session_id": str(worker_session.id),
+                    "allowed_paths": allowed_paths,
+                    "dependency_task_ids": [str(d) for d in dep_ids],
+                    "active_dependency_task_ids": [str(d) for d in dep_ids],  # resolved in next tick
+                    "last_assigned_at": datetime.now(UTC).isoformat(),
+                })
+                if dep_ids:
+                    orchestration["blocked_reason"] = "waiting_on_dependencies"
+                    child_task.status = TaskStatus.BLOCKED
+                else:
+                    child_task.status = TaskStatus.IN_PROGRESS
+                child_task.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+
+                worker_session.metadata_json = {
+                    **dict(worker_session.metadata_json),
+                    "assignment": {
+                        "task_id": str(child_task.id),
+                        "allowed_paths": allowed_paths,
+                        "dependency_task_ids": [str(d) for d in dep_ids],
+                    },
+                }
+                db.flush()
+
+                event_service.record_event(
+                    EventCreate(
+                        category=EventCategory.TASK,
+                        event_type="task.assigned",
+                        level=EventLevel.INFO,
+                        source=EventSourceRef(kind="service", role=SessionRole.MANAGER, id="orchestrator.plan"),
+                        project_id=project.id,
+                        task_id=child_task.id,
+                        session_id=worker_session.id,
+                        payload={"allowed_paths": allowed_paths},
+                    )
+                )
+
+                actions.append(
+                    OrchestratorActionRead(
+                        kind="worker_created_from_plan",
+                        project_id=project.id,
+                        task_id=child_task.id,
+                        session_id=worker_session.id,
+                        detail=f"Auto-created worker for: {child_task.title}",
+                        payload={},
+                    )
+                )
+
+            # Mark plan event as processed (idempotency)
+            processed_ids = list(manager_orch.get("processed_plan_event_ids", []))
+            processed_ids.append(str(event.id))
+            manager_orch["processed_plan_event_ids"] = processed_ids
+            manager_meta["orchestrator"] = manager_orch
+            if manager_session:
+                manager_session.metadata_json = manager_meta
+
+            # Update parent task status
+            if parent_task_id:
+                parent_task = db.get(Task, parent_task_id)
+                if parent_task and parent_task.status == TaskStatus.PENDING:
+                    parent_task.status = TaskStatus.IN_PROGRESS
+
+            db.commit()
+
+            # Provision workspaces and start worker sessions that don't have unresolved dependencies
+            for idx, child_task_id in enumerate(created_task_ids):
+                child_task = db.get(Task, child_task_id)
+                if child_task and child_task.status == TaskStatus.IN_PROGRESS:
+                    orch = self._task_orchestration(child_task.metadata_json)
+                    worker_sid = orch.get("assigned_session_id")
+                    if worker_sid:
+                        try:
+                            workspace_service.provision_session_workspace(UUID(worker_sid))
+                        except Exception as exc:
+                            logger.warning("failed to provision workspace for worker %s: %s", worker_sid, exc)
+                        try:
+                            self.session_supervisor.start_session(UUID(worker_sid))
+                        except Exception as exc:
+                            logger.warning("failed to auto-start worker %s: %s", worker_sid, exc)
+
+        return actions
+
+    def _retry_failed_workers(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        workspace_service: WorkspaceService,
+        project: Project,
+        tasks: list[Task],
+        sessions: list[SessionModel],
+    ) -> list[OrchestratorActionRead]:
+        """When a worker session FAILED, create a new worker session and re-start the task.
+
+        Only retries once — tracked via ``retry_count`` in task orchestration metadata.
+        """
+        actions: list[OrchestratorActionRead] = []
+        session_by_id = {s.id: s for s in sessions}
+
+        for task in tasks:
+            if task.status not in {TaskStatus.BLOCKED}:
+                continue
+            task_metadata = dict(task.metadata_json)
+            orchestration = self._task_orchestration(task_metadata)
+            blocked_reason = orchestration.get("blocked_reason", "")
+            if blocked_reason not in {"failed", "stopped", "session_blocked", "needs_changes"}:
+                continue
+            retry_count = int(orchestration.get("retry_count", 0))
+            max_retries = self.settings.orchestrator_manager_review_max_rounds if blocked_reason == "needs_changes" else 1
+            if retry_count >= max_retries:
+                continue
+
+            assigned_sid = orchestration.get("assigned_session_id")
+            if not assigned_sid:
+                continue
+            old_session = session_by_id.get(UUID(assigned_sid))
+            if old_session is None:
+                continue
+            # For needs_changes, the old worker completed successfully but was rejected by manager
+            allowed_old_statuses = {SessionStatus.FAILED, SessionStatus.STOPPED}
+            if blocked_reason == "needs_changes":
+                allowed_old_statuses.add(SessionStatus.COMPLETED)
+            if old_session.status not in allowed_old_statuses:
+                continue
+
+            task_record = db.get(Task, task.id)
+            if task_record is None:
+                continue
+
+            logger.info("auto-retrying failed worker for task %s (retry %d)", task.id, retry_count + 1)
+
+            # Create new worker session
+            launch_plan = self.session_supervisor.plan_session(
+                role=SessionRole.WORKER,
+                runtime_preference="auto",
+                allow_simulation_fallback=True,
+            )
+            worker_session = SessionModel(
+                project_id=project.id,
+                task_id=task.id,
+                supervisor_session_id=old_session.supervisor_session_id,
+                role=SessionRole.WORKER,
+                status=launch_plan.initial_status,
+                transport=launch_plan.transport,
+                adapter_kind=launch_plan.adapter_kind,
+                command=launch_plan.command,
+                blocked_reason=launch_plan.blocked_reason,
+                metadata_json={
+                    "preferred_engine": "auto",
+                    "created_from": "auto_retry",
+                    "retry_of_session_id": str(old_session.id),
+                    "simulation_mode": launch_plan.simulation_mode,
+                    "launch_notes": launch_plan.notes,
+                    "runtime": launch_plan.runtime.model_dump(mode="json"),
+                },
+                runtime_metadata_json={},
+            )
+            db.add(worker_session)
+            db.flush()
+
+            # Provision workspace
+            repo_info = self.repo_inspector.inspect(project.repo_path, project.default_branch)
+            workspace_plan = self.worktree_manager.plan_workspace(
+                project_slug=project.slug,
+                project_id=project.id,
+                role=SessionRole.WORKER,
+                task_id=task.id,
+                session_id=worker_session.id,
+                base_branch=project.default_branch,
+            )
+            workspace = Workspace(
+                project_id=project.id,
+                session_id=worker_session.id,
+                branch_name=workspace_plan.branch_name,
+                base_branch=workspace_plan.base_branch,
+                base_commit=repo_info.current_commit or "",
+                head_commit=repo_info.current_commit,
+                workspace_path=workspace_plan.workspace_path,
+                status=workspace_plan.status,
+                metadata_json={"ownership": {"session_id": str(worker_session.id)}},
+            )
+            db.add(workspace)
+            worker_session.branch_name = workspace.branch_name
+            worker_session.workspace_path = workspace.workspace_path
+            db.flush()
+
+            # Update task metadata
+            orchestration["assigned_session_id"] = str(worker_session.id)
+            orchestration["retry_count"] = retry_count + 1
+            orchestration["blocked_reason"] = None
+            orchestration["last_assigned_at"] = datetime.now(UTC).isoformat()
+            task_record.status = TaskStatus.IN_PROGRESS
+            task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+            db.flush()
+
+            event_service.record_event(
+                EventCreate(
+                    category=EventCategory.TASK,
+                    event_type="task.assigned",
+                    level=EventLevel.INFO,
+                    source=EventSourceRef(kind="service", role=SessionRole.WORKER, id="orchestrator.retry"),
+                    project_id=project.id,
+                    task_id=task.id,
+                    session_id=worker_session.id,
+                    payload={"retry_count": retry_count + 1, "previous_session_id": str(old_session.id)},
+                )
+            )
+            actions.append(
+                OrchestratorActionRead(
+                    kind="worker_retried",
+                    project_id=project.id,
+                    task_id=task.id,
+                    session_id=worker_session.id,
+                    detail=f"Auto-retried failed worker (attempt {retry_count + 1}).",
+                    payload={"retry_of_session_id": str(old_session.id)},
+                )
+            )
+            db.commit()
+
+            # Provision workspace and start the new worker
+            try:
+                workspace_service.provision_session_workspace(worker_session.id)
+            except Exception as exc:
+                logger.warning("failed to provision workspace for retried worker %s: %s", worker_session.id, exc)
+            try:
+                self.session_supervisor.start_session(worker_session.id)
+            except Exception as exc:
+                logger.warning("failed to start retried worker %s: %s", worker_session.id, exc)
+
+        return actions
+
+    def _complete_parent_tasks(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        tasks: list[Task],
+    ) -> list[OrchestratorActionRead]:
+        """Auto-complete parent (goal) tasks when ALL their children are DONE."""
+        actions: list[OrchestratorActionRead] = []
+
+        # Group child tasks by parent_task_id
+        children_by_parent: dict[UUID, list[Task]] = {}
+        for task in tasks:
+            if task.parent_task_id:
+                children_by_parent.setdefault(task.parent_task_id, []).append(task)
+
+        for parent_id, children in children_by_parent.items():
+            if not children:
+                continue
+            if not all(c.status == TaskStatus.DONE for c in children):
+                continue
+
+            parent = db.get(Task, parent_id)
+            if parent is None or parent.status in {TaskStatus.DONE, TaskStatus.CANCELED}:
+                continue
+
+            logger.info("auto-completing parent task %s — all %d children done", parent_id, len(children))
+            parent.status = TaskStatus.DONE
+            parent_meta = dict(parent.metadata_json)
+            orch = self._task_orchestration(parent_meta)
+            orch["auto_completed"] = True
+            orch["completed_at"] = datetime.now(UTC).isoformat()
+            orch["completion_summary"] = f"All {len(children)} subtasks completed successfully."
+            parent.metadata_json = self._store_task_orchestration(parent_meta, orch)
+            db.flush()
+
+            event_service.record_event(
+                EventCreate(
+                    category=EventCategory.TASK,
+                    event_type="task.completed",
+                    level=EventLevel.INFO,
+                    source=EventSourceRef(kind="service", id="orchestrator.parent_completion"),
+                    project_id=parent.project_id,
+                    task_id=parent.id,
+                    payload={
+                        "auto_completed": True,
+                        "child_count": len(children),
+                    },
+                )
+            )
+            actions.append(
+                OrchestratorActionRead(
+                    kind="parent_task_completed",
+                    project_id=parent.project_id,
+                    task_id=parent.id,
+                    detail=f"Goal completed — all {len(children)} subtasks done.",
+                    payload={},
+                )
+            )
+            db.commit()
+
+        return actions
+
+    def _start_unblocked_workers(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        workspace_service: WorkspaceService,
+        tasks: list[Task],
+        sessions: list[SessionModel],
+    ) -> list[OrchestratorActionRead]:
+        """Start worker sessions for tasks that were just unblocked from dependency resolution."""
+        actions: list[OrchestratorActionRead] = []
+        session_by_id = {s.id: s for s in sessions}
+
+        for task in tasks:
+            if task.status != TaskStatus.IN_PROGRESS:
+                continue
+            orchestration = self._task_orchestration(task.metadata_json)
+            assigned_sid = orchestration.get("assigned_session_id")
+            if not assigned_sid:
+                continue
+
+            session = session_by_id.get(UUID(assigned_sid))
+            if session is None:
+                # Session might be newly created — reload
+                with self.database.session() as fresh_db:
+                    session = fresh_db.get(SessionModel, UUID(assigned_sid))
+            if session is None or session.status != SessionStatus.PENDING:
+                continue
+
+            # This task is IN_PROGRESS with a PENDING worker — provision workspace and start it
+            logger.info("auto-starting unblocked worker %s for task %s", assigned_sid, task.id)
+            try:
+                workspace_service.provision_session_workspace(UUID(assigned_sid))
+            except Exception as exc:
+                logger.warning("failed to provision workspace for worker %s: %s", assigned_sid, exc)
+            try:
+                self.session_supervisor.start_session(UUID(assigned_sid))
+                actions.append(
+                    OrchestratorActionRead(
+                        kind="worker_auto_started",
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        session_id=UUID(assigned_sid),
+                        detail="Auto-started worker after dependencies resolved.",
+                        payload={},
+                    )
+                )
+            except Exception as exc:
+                logger.warning("failed to auto-start unblocked worker %s: %s", assigned_sid, exc)
+
+        return actions
+
+    def _launch_manager_reviews(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        workspace_service: WorkspaceService,
+        project: Project,
+        tasks: list[Task],
+        sessions: list[SessionModel],
+    ) -> list[OrchestratorActionRead]:
+        """Spawn manager review sessions for completed worker tasks awaiting review."""
+        if not self.settings.orchestrator_manager_review_enabled:
+            return []
+
+        actions: list[OrchestratorActionRead] = []
+
+        for task in tasks:
+            if task.status != TaskStatus.REVIEW:
+                continue
+            task_metadata = dict(task.metadata_json)
+            orchestration = self._task_orchestration(task_metadata)
+            if not orchestration.get("awaiting_manager_review"):
+                continue
+            if orchestration.get("reviewer_session_id"):
+                continue  # Already launched a review session
+
+            # Check review round limits
+            review_round = int(orchestration.get("review_round", 0))
+            if review_round >= self.settings.orchestrator_manager_review_max_rounds:
+                logger.info("auto-approving task %s after %d review rounds", task.id, review_round)
+                task_record = db.get(Task, task.id)
+                if task_record:
+                    task_record.status = TaskStatus.DONE
+                    orchestration["awaiting_manager_review"] = False
+                    orchestration["auto_approved_reason"] = "max_review_rounds"
+                    task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                    db.flush()
+                    actions.append(OrchestratorActionRead(
+                        kind="task_auto_approved",
+                        project_id=project.id, task_id=task.id, session_id=None,
+                        detail=f"Auto-approved after {review_round} review rounds.",
+                        payload={},
+                    ))
+                continue
+
+            # Get the worker's diff
+            worker_sid = orchestration.get("assigned_session_id")
+            if not worker_sid:
+                continue
+
+            diff_text = ""
+            changed_files: list[str] = []
+            try:
+                workspace_status = workspace_service.get_session_workspace(UUID(worker_sid))
+                diff_read = workspace_service.get_diff(workspace_status.id)
+                diff_text = diff_read.diff or ""
+                changed_files = diff_read.changed_files or []
+            except Exception as exc:
+                logger.warning("could not get diff for review of task %s: %s", task.id, exc)
+                # If no diff available, auto-approve
+                task_record = db.get(Task, task.id)
+                if task_record:
+                    task_record.status = TaskStatus.DONE
+                    orchestration["awaiting_manager_review"] = False
+                    orchestration["auto_approved_reason"] = "no_diff_available"
+                    task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                    db.flush()
+                    actions.append(OrchestratorActionRead(
+                        kind="task_auto_approved",
+                        project_id=project.id, task_id=task.id, session_id=None,
+                        detail="Auto-approved (could not retrieve diff for review).",
+                        payload={},
+                    ))
+                continue
+
+            # Build review prompt
+            try:
+                review_packet = self.task_packet_service.build_manager_review_packet(
+                    UUID(worker_sid),  # temporary — we'll create a new session below
+                    diff=diff_text,
+                    changed_files=changed_files,
+                )
+            except Exception:
+                # build_manager_review_packet needs a session with a task — use the task directly
+                review_packet = None
+
+            if not review_packet:
+                # Fallback: build manually
+                acceptance = "\n".join(f"- {c}" for c in task.acceptance_criteria if c) or "- Complete the task."
+                review_packet = (
+                    f"Review this worker's completed task.\n\n"
+                    f"Task: {task.title}\nDescription: {task.description}\n\n"
+                    f"Acceptance criteria:\n{acceptance}\n\n"
+                    f"Changed files: {', '.join(changed_files[:10])}\n\n"
+                    f"Diff:\n```diff\n{diff_text[:8000]}\n```\n\n"
+                    f"Emit [[EVENT]] with type 'complete', result 'approved' or 'needs_changes'.\n"
+                )
+
+            # Create manager review session
+            launch_plan = self.session_supervisor.plan_session(
+                role=SessionRole.MANAGER,
+                runtime_preference="auto",
+                allow_simulation_fallback=True,
+            )
+            reviewer_session = SessionModel(
+                project_id=project.id,
+                task_id=task.id,
+                role=SessionRole.MANAGER,
+                status=launch_plan.initial_status,
+                transport=launch_plan.transport,
+                adapter_kind=launch_plan.adapter_kind,
+                command=launch_plan.command,
+                workspace_path=project.repo_path,
+                metadata_json={
+                    "is_review": True,
+                    "review_of_session_id": worker_sid,
+                    "review_round": review_round + 1,
+                    "simulation_mode": launch_plan.simulation_mode,
+                    "runtime": launch_plan.runtime.model_dump(mode="json"),
+                },
+                runtime_metadata_json={},
+            )
+            db.add(reviewer_session)
+            db.flush()
+
+            # Update task metadata
+            task_record = db.get(Task, task.id)
+            if task_record:
+                orchestration["reviewer_session_id"] = str(reviewer_session.id)
+                orchestration["review_round"] = review_round + 1
+                task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                db.flush()
+
+            # Commit so the session is visible to the supervisor's separate DB session
+            db.commit()
+
+            # Start the review session
+            try:
+                self.session_supervisor.start_session(reviewer_session.id, initial_message=review_packet)
+            except Exception as exc:
+                logger.warning("failed to start manager review session %s: %s", reviewer_session.id, exc)
+
+            actions.append(OrchestratorActionRead(
+                kind="manager_review_launched",
+                project_id=project.id, task_id=task.id, session_id=reviewer_session.id,
+                detail=f"Manager reviewing worker output (round {review_round + 1}).",
+                payload={"review_round": review_round + 1},
+            ))
+
+        return actions
+
+    def _process_manager_review_results(
+        self,
+        *,
+        db,
+        event_service: EventService,
+        workspace_service: WorkspaceService,
+        project: Project,
+        tasks: list[Task],
+        sessions: list[SessionModel],
+    ) -> list[OrchestratorActionRead]:
+        """Process completed manager review sessions — approve or request changes."""
+        actions: list[OrchestratorActionRead] = []
+        session_by_id = {s.id: s for s in sessions}
+
+        for task in tasks:
+            if task.status != TaskStatus.REVIEW:
+                continue
+            task_metadata = dict(task.metadata_json)
+            orchestration = self._task_orchestration(task_metadata)
+            reviewer_sid = orchestration.get("reviewer_session_id")
+            if not reviewer_sid:
+                continue
+
+            reviewer = session_by_id.get(UUID(reviewer_sid))
+            if reviewer is None:
+                with self.database.session() as fresh_db:
+                    reviewer = fresh_db.get(SessionModel, UUID(reviewer_sid))
+            if reviewer is None or reviewer.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+                continue
+
+            task_record = db.get(Task, task.id)
+            if task_record is None:
+                continue
+
+            # If reviewer failed, auto-approve
+            if reviewer.status == SessionStatus.FAILED:
+                logger.warning("manager review session %s failed, auto-approving task %s", reviewer_sid, task.id)
+                task_record.status = TaskStatus.DONE
+                orchestration["awaiting_manager_review"] = False
+                orchestration["reviewer_session_id"] = None
+                orchestration["auto_approved_reason"] = "reviewer_failed"
+                task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                db.flush()
+                actions.append(OrchestratorActionRead(
+                    kind="task_auto_approved",
+                    project_id=project.id, task_id=task.id, session_id=UUID(reviewer_sid),
+                    detail="Auto-approved (manager review session failed).",
+                    payload={},
+                ))
+                continue
+
+            # Parse the reviewer's verdict from structured events
+            from app.models.parsed_session_event import ParsedSessionEvent
+            verdict_events = db.scalars(
+                select(ParsedSessionEvent)
+                .where(
+                    ParsedSessionEvent.session_id == UUID(reviewer_sid),
+                    ParsedSessionEvent.event_type == "complete",
+                )
+                .order_by(ParsedSessionEvent.sequence.desc())
+                .limit(1)
+            ).all()
+
+            verdict = "approved"  # default if no verdict found
+            feedback: list[str] = []
+            if verdict_events:
+                payload = verdict_events[0].payload_json or {}
+                result = payload.get("result", "")
+                details = payload.get("details", {})
+                if isinstance(details, dict):
+                    v = details.get("verdict", result)
+                    if v in ("needs_changes", "rejected"):
+                        verdict = "needs_changes"
+                        fb = details.get("feedback", [])
+                        if isinstance(fb, list):
+                            feedback = [str(f) for f in fb if f]
+                        elif isinstance(fb, str):
+                            feedback = [fb]
+                elif result in ("needs_changes", "rejected"):
+                    verdict = "needs_changes"
+
+            if verdict == "approved":
+                # Extract manager's notes from the verdict event
+                verdict_notes = ""
+                if verdict_events:
+                    payload = verdict_events[0].payload_json or {}
+                    details = payload.get("details", {})
+                    if isinstance(details, dict):
+                        verdict_notes = details.get("notes", "")
+                    summary_text = payload.get("summary", "")
+                    # Skip generic adapter messages as summaries
+                    generic_msgs = {"Real Codex execution finished.", "Real Claude Code execution finished."}
+                    if not verdict_notes and summary_text and summary_text not in generic_msgs:
+                        verdict_notes = summary_text
+
+                task_record.status = TaskStatus.DONE
+                orchestration["awaiting_manager_review"] = False
+                orchestration["reviewer_session_id"] = None
+                orchestration["completion_summary"] = verdict_notes or "Manager approved — task complete."
+                orchestration["completed_at"] = datetime.now(UTC).isoformat()
+                task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                db.flush()
+
+                # Also auto-approve any legacy Review records for this task
+                from app.models.review import Review as ReviewModel
+                pending_reviews = db.scalars(
+                    select(ReviewModel).where(
+                        ReviewModel.task_id == task.id,
+                        ReviewModel.status.in_(["pending", "running", "needs_changes"]),
+                    )
+                ).all()
+                for pr in pending_reviews:
+                    pr.status = ReviewStatus.APPROVED
+                    db.flush()
+
+                actions.append(OrchestratorActionRead(
+                    kind="task_manager_approved",
+                    project_id=project.id, task_id=task.id, session_id=UUID(reviewer_sid),
+                    detail=f"Manager approved: {verdict_notes}" if verdict_notes else "Manager approved worker output.",
+                    payload={"summary": verdict_notes},
+                ))
+            else:
+                # Needs changes — send back to worker with feedback
+                logger.info("manager requested changes for task %s: %s", task.id, feedback)
+                orchestration["awaiting_manager_review"] = False
+                orchestration["reviewer_session_id"] = None
+                orchestration["manager_feedback"] = feedback
+                orchestration["blocked_reason"] = "needs_changes"
+                task_record.status = TaskStatus.BLOCKED
+                task_record.metadata_json = self._store_task_orchestration(task_metadata, orchestration)
+                db.flush()
+                actions.append(OrchestratorActionRead(
+                    kind="task_needs_changes",
+                    project_id=project.id, task_id=task.id, session_id=UUID(reviewer_sid),
+                    detail=f"Manager requested changes: {'; '.join(feedback[:3])}",
+                    payload={"feedback": feedback},
+                ))
+
+        return actions
 
     def _reconcile_dependencies(
         self,
@@ -440,7 +1354,9 @@ class OrchestratorService:
                             payload={"dependency_task_ids": [str(dependency_id) for dependency_id in unresolved]},
                         )
                     )
-            elif current_orchestration.get("blocked_reason") == "waiting_on_dependencies":
+            elif task_record.status == TaskStatus.BLOCKED:
+                # Dependencies resolved — unblock regardless of the current blocked_reason
+                # (scope_conflict, waiting_on_dependencies, etc. are all resolved once deps are done)
                 current_orchestration["blocked_reason"] = None
                 task_record.status = (
                     TaskStatus.IN_PROGRESS if session is not None else TaskStatus.PENDING
@@ -528,30 +1444,49 @@ class OrchestratorService:
             TaskStatus.REVIEW,
             TaskStatus.DONE,
         }:
-            if latest_review is None:
-                review = review_service.create_review(
-                    ReviewCreate(
-                        project_id=task_record.project_id,
-                        task_id=task_record.id,
-                        requester_session_id=session_record.id,
-                        summary="Queued automatically by the orchestrator after worker completion.",
-                        metadata={"auto_queued": True},
-                    )
-                )
-                orchestration["review_id"] = str(review.id)
+            # Manager-planned tasks go through automated manager review — no human review needed
+            created_by = task_metadata.get("created_by", "")
+            if created_by == "manager_plan":
+                task_record.status = TaskStatus.REVIEW
+                orchestration["blocked_reason"] = None
+                orchestration["awaiting_manager_review"] = True
+                orchestration["review_requested_at"] = now.isoformat()
                 actions.append(
                     OrchestratorActionRead(
-                        kind="review_queued",
+                        kind="task_awaiting_manager_review",
                         project_id=task_record.project_id,
                         task_id=task_record.id,
                         session_id=session_record.id,
-                        detail="Queued review for completed worker task.",
-                        payload={"review_id": str(review.id)},
+                        detail="Worker completed — queued for automated manager review.",
+                        payload={},
                     )
                 )
-            task_record.status = TaskStatus.REVIEW
-            orchestration["blocked_reason"] = None
-            orchestration["review_requested_at"] = now.isoformat()
+            else:
+                # Non-manager tasks: create a review for human approval
+                if latest_review is None:
+                    review = review_service.create_review(
+                        ReviewCreate(
+                            project_id=task_record.project_id,
+                            task_id=task_record.id,
+                            requester_session_id=session_record.id,
+                            summary="Queued automatically by the orchestrator after worker completion.",
+                            metadata={"auto_queued": True},
+                        )
+                    )
+                    orchestration["review_id"] = str(review.id)
+                    actions.append(
+                        OrchestratorActionRead(
+                            kind="review_queued",
+                            project_id=task_record.project_id,
+                            task_id=task_record.id,
+                            session_id=session_record.id,
+                            detail="Queued review for completed worker task.",
+                            payload={"review_id": str(review.id)},
+                        )
+                    )
+                task_record.status = TaskStatus.REVIEW
+                orchestration["blocked_reason"] = None
+                orchestration["review_requested_at"] = now.isoformat()
 
         if self._session_is_idle(session_record, now=now):
             session_metadata = dict(session_record.metadata_json)
@@ -672,6 +1607,13 @@ class OrchestratorService:
                 return False
             task_metadata = dict(task.metadata_json)
             orchestration = self._task_orchestration(task_metadata)
+
+            # Never block manager-planned tasks for scope conflicts — the manager
+            # already planned execution order with dependencies. Scope overlap is
+            # expected and handled by the dependency chain.
+            if action.kind == "scope_conflict" and task_metadata.get("created_by") == "manager_plan":
+                return False
+
             conflict_reason = action.kind
             existing_conflicts = list(orchestration.get("conflicts", []))
             rendered_conflict = {
@@ -681,6 +1623,9 @@ class OrchestratorService:
             }
             if rendered_conflict in existing_conflicts and orchestration.get("blocked_reason") == conflict_reason:
                 return False
+            # Cap conflict accumulation to prevent metadata bloat
+            if len(existing_conflicts) > 20:
+                existing_conflicts = existing_conflicts[-10:]
             existing_conflicts.append(rendered_conflict)
             orchestration["conflicts"] = existing_conflicts
             orchestration["blocked_reason"] = conflict_reason

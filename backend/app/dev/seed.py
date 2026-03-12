@@ -11,13 +11,15 @@ from sqlalchemy import func, select
 
 from app.core.config import Settings, get_settings
 from app.core.container import ServiceContainer, build_container
-from app.core.enums import SessionRole, TaskStatus
+from app.core.enums import EventCategory, EventLevel, SessionRole, TaskStatus
 from app.models import Base
+from app.models.event import Event
 from app.models.project import Project
 from app.models.review import Review
 from app.models.session import Session as SessionModel
 from app.models.task import Task
 from app.models.workspace import Workspace
+from app.schemas.event import EventCreate, EventSourceRef
 from app.schemas.project import ProjectCreate, ProjectRead
 from app.schemas.review import ReviewCreate
 from app.schemas.session import SessionCreate, SessionRead
@@ -31,10 +33,66 @@ from app.services.workspace_service import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
-DEMO_PROJECT_NAME = "Local Agent Orchestrator Demo"
+DEMO_PROJECT_NAME = "Poulpe AI Demo"
 DEMO_COMMIT_MESSAGE = "Seed demo repository"
-DEMO_GIT_USER_NAME = "Local Agent Orchestrator"
-DEMO_GIT_USER_EMAIL = "demo@local-agent-orchestrator.local"
+DEMO_GIT_USER_NAME = "Poulpe AI"
+DEMO_GIT_USER_EMAIL = "demo@poulpe-ai.local"
+DEMO_EVENT_SOURCE_ID = "demo-seed"
+
+DEMO_SAMPLE_TASKS = [
+    {
+        "id": "frontend",
+        "label": "Frontend polish",
+        "title": "Make the review screen easier to scan",
+        "description": (
+            "Simplify the approval view so changed files, check results, and the final "
+            "decision are obvious at a glance."
+        ),
+        "scope": ["frontend"],
+        "engine": "auto",
+    },
+    {
+        "id": "backend",
+        "label": "Backend cleanup",
+        "title": "Tighten structured event handling",
+        "description": (
+            "Improve worker event parsing so malformed output is easier to debug and valid "
+            "progress updates stay readable."
+        ),
+        "scope": ["backend"],
+        "engine": "auto",
+    },
+    {
+        "id": "docs",
+        "label": "Docs update",
+        "title": "Explain the approval flow clearly",
+        "description": (
+            "Document the path from task start to approval so a new developer can follow the "
+            "workflow quickly."
+        ),
+        "scope": ["docs"],
+        "engine": "auto",
+    },
+]
+
+DEMO_HOW_IT_WORKS = [
+    {
+        "title": "1. Enter a task",
+        "detail": "Describe the change you want in the active repo workspace.",
+    },
+    {
+        "title": "2. Narrow the scope",
+        "detail": "Optionally pick a folder or file area so the task stays focused.",
+    },
+    {
+        "title": "3. Start work",
+        "detail": "The app creates the internal task, agent, worktree, and runtime setup.",
+    },
+    {
+        "title": "4. Review the result",
+        "detail": "When work is done, inspect the summary, changed files, checks, and approve or request changes.",
+    },
+]
 
 DEMO_REPO_FILES: dict[str, str] = {
     "README.md": """# Demo Local Agent Repo
@@ -178,12 +236,6 @@ def seed_demo_environment(
                 redis_bus=active_container.redis_bus,
                 event_broker=active_container.event_broker,
             )
-            project_service = ProjectService(
-                db=db,
-                event_service=event_service,
-                repo_inspector=active_container.repo_inspector,
-            )
-            task_service = TaskService(db=db, event_service=event_service)
             workspace_service = WorkspaceService(
                 db=db,
                 event_service=event_service,
@@ -191,12 +243,24 @@ def seed_demo_environment(
                 repo_inspector=active_container.repo_inspector,
                 command_runner=active_container.command_runner,
             )
+            project_service = ProjectService(
+                db=db,
+                settings=settings,
+                event_service=event_service,
+                command_runner=active_container.command_runner,
+                repo_inspector=active_container.repo_inspector,
+                runtime_service=active_container.runtime_service,
+                session_supervisor=active_container.session_supervisor,
+                workspace_service=workspace_service,
+            )
+            task_service = TaskService(db=db, event_service=event_service)
             session_service = SessionService(
                 db=db,
                 event_service=event_service,
                 session_supervisor=active_container.session_supervisor,
                 worktree_manager=active_container.worktree_manager,
                 repo_inspector=active_container.repo_inspector,
+                runtime_service=active_container.runtime_service,
                 workspace_service=workspace_service,
             )
             review_service = ReviewService(
@@ -211,36 +275,39 @@ def seed_demo_environment(
                 task_service,
                 db,
                 project.id,
-                title="Stabilize worker structured events",
-                description="Keep the worker event stream readable, typed, and recoverable when output is malformed.",
+                title="Tighten structured event handling",
+                aliases=["Stabilize worker structured events"],
+                description="Improve worker event parsing so malformed output is easier to debug and valid progress updates stay readable.",
                 acceptance_criteria=[
-                    "parse [[EVENT]] blocks",
-                    "persist structured events separately from raw transcript",
-                    "surface malformed blocks for debugging",
+                    "keep valid event blocks readable",
+                    "surface malformed event blocks clearly",
+                    "preserve structured events separately from the raw transcript",
                 ],
             )
             review_task = _ensure_task(
                 task_service,
                 db,
                 project.id,
-                title="Polish review handoff panel",
-                description="Package diff summary, test outcomes, and reviewer notes for operators.",
+                title="Make the review screen easier to scan",
+                aliases=["Polish review handoff panel"],
+                description="Simplify the approval view so changed files, check results, and the final decision are obvious at a glance.",
                 acceptance_criteria=[
-                    "show diff summary",
-                    "show lint and test outcomes",
-                    "capture reviewer notes and human approval state",
+                    "highlight changed files",
+                    "show lint and test outcomes clearly",
+                    "keep the approval decision easy to scan",
                 ],
             )
             blocked_task = _ensure_task(
                 task_service,
                 db,
                 project.id,
-                title="Document merge queue handoff",
-                description="Clarify what happens after review approval and before merge execution.",
+                title="Explain the approval flow clearly",
+                aliases=["Document merge queue handoff"],
+                description="Document the path from task start to approval so a new developer can follow the workflow quickly.",
                 acceptance_criteria=[
-                    "document merge-ready gate",
-                    "document human approval requirement",
-                    "document where merge execution plugs in later",
+                    "describe the approval handoff clearly",
+                    "mention the human approval gate",
+                    "note where merge execution plugs in later",
                 ],
             )
 
@@ -298,6 +365,19 @@ def seed_demo_environment(
                 worker_session=review_worker_session,
             )
 
+            _ensure_demo_activity(
+                db=db,
+                event_service=event_service,
+                project_id=project.id,
+                active_task=active_task,
+                review_task=review_task,
+                blocked_task=blocked_task,
+                active_worker_session=active_worker_session,
+                review_worker_session=review_worker_session,
+                blocked_worker_session=blocked_worker_session,
+                review_id=review.id,
+            )
+
             task_ids = [str(active_task.id), str(review_task.id), str(blocked_task.id)]
             session_ids = [
                 str(manager_session.id),
@@ -347,6 +427,20 @@ def _ensure_project(
 ) -> ProjectRead:
     existing = db.scalar(select(Project).where(Project.repo_path == str(repo_path)))
     if existing is not None:
+        metadata = dict(existing.metadata_json)
+        metadata.setdefault("seeded_demo", True)
+        metadata.setdefault(
+            "helper_text",
+            "Use the sample tasks to start a frontend, backend, or docs workflow in under a minute.",
+        )
+        metadata["demo"] = {
+            "sample_tasks": DEMO_SAMPLE_TASKS,
+            "how_it_works": DEMO_HOW_IT_WORKS,
+            "default_flow": "start_task_to_review",
+        }
+        existing.metadata_json = metadata
+        db.commit()
+        db.refresh(existing)
         return ProjectRead.model_validate(existing)
     return project_service.create_project(
         ProjectCreate(
@@ -354,7 +448,15 @@ def _ensure_project(
             repo_path=str(repo_path),
             metadata={
                 "seeded_demo": True,
-                "notes": "Created automatically for local operator-console development.",
+                "notes": "Created automatically for local workspace-console development.",
+                "helper_text": (
+                    "Use the sample tasks to start a frontend, backend, or docs workflow in under a minute."
+                ),
+                "demo": {
+                    "sample_tasks": DEMO_SAMPLE_TASKS,
+                    "how_it_works": DEMO_HOW_IT_WORKS,
+                    "default_flow": "start_task_to_review",
+                },
             },
         )
     )
@@ -366,13 +468,23 @@ def _ensure_task(
     project_id: UUID,
     *,
     title: str,
+    aliases: list[str] | None = None,
     description: str,
     acceptance_criteria: list[str],
 ) -> TaskRead:
+    candidate_titles = [title, *(aliases or [])]
     existing = db.scalar(
-        select(Task).where(Task.project_id == project_id, Task.title == title)
+        select(Task).where(Task.project_id == project_id, Task.title.in_(candidate_titles))
     )
     if existing is not None:
+        existing.title = title
+        metadata = dict(existing.metadata_json)
+        metadata.setdefault("seeded_demo", True)
+        existing.metadata_json = metadata
+        existing.acceptance_criteria = acceptance_criteria
+        existing.description = description
+        db.commit()
+        db.refresh(existing)
         return TaskRead.model_validate(existing)
     return task_service.create_task(
         TaskCreate(
@@ -441,7 +553,12 @@ def _ensure_review(
         raise RuntimeError(f"Expected workspace for demo worker session {worker_session.id}")
 
     review_file = Path(workspace.workspace_path) / "frontend/components/ReviewPanel.tsx"
-    current_content = review_file.read_text(encoding="utf-8")
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    current_content = (
+        review_file.read_text(encoding="utf-8")
+        if review_file.exists()
+        else DEMO_REPO_FILES["frontend/components/ReviewPanel.tsx"]
+    )
     if "Operators need quick check summaries" not in current_content:
         review_file.write_text(
             current_content.replace(
@@ -466,6 +583,97 @@ def _ensure_review(
     if review is None:
         raise RuntimeError(f"Expected review to exist after creation: {review_read.id}")
     return review
+
+
+def _ensure_demo_activity(
+    *,
+    db,
+    event_service: EventService,
+    project_id: UUID,
+    active_task: TaskRead,
+    review_task: TaskRead,
+    blocked_task: TaskRead,
+    active_worker_session: SessionRead,
+    review_worker_session: SessionRead,
+    blocked_worker_session: SessionRead,
+    review_id: UUID,
+) -> None:
+    existing_events = db.scalars(select(Event).where(Event.project_id == project_id)).all()
+    if any(event.source.get("id") == DEMO_EVENT_SOURCE_ID for event in existing_events):
+        return
+
+    source = EventSourceRef(kind="service", id=DEMO_EVENT_SOURCE_ID)
+    seeded_events = [
+        EventCreate(
+            category=EventCategory.SESSION,
+            event_type="session.progress",
+            level=EventLevel.INFO,
+            source=source,
+            project_id=project_id,
+            task_id=active_task.id,
+            session_id=active_worker_session.id,
+            payload={
+                "summary": "Agent inspected the backend event pipeline and started a focused parser cleanup.",
+                "files": ["backend/app/services", "backend/app/adapters"],
+            },
+        ),
+        EventCreate(
+            category=EventCategory.SESSION,
+            event_type="session.tests_run",
+            level=EventLevel.INFO,
+            source=source,
+            project_id=project_id,
+            task_id=active_task.id,
+            session_id=active_worker_session.id,
+            payload={
+                "summary": "Ran a quick backend check after adjusting the worker event flow.",
+                "command": "pytest -q tests/test_event_parser.py",
+                "status": "passed",
+                "exit_code": 0,
+            },
+        ),
+        EventCreate(
+            category=EventCategory.SESSION,
+            event_type="session.complete",
+            level=EventLevel.INFO,
+            source=source,
+            project_id=project_id,
+            task_id=review_task.id,
+            session_id=review_worker_session.id,
+            payload={
+                "summary": "Prepared the review screen changes and handed the result to approval.",
+                "files": ["frontend/components/ReviewPanel.tsx"],
+            },
+        ),
+        EventCreate(
+            category=EventCategory.TASK,
+            event_type="task.blocked",
+            level=EventLevel.WARN,
+            source=source,
+            project_id=project_id,
+            task_id=blocked_task.id,
+            session_id=blocked_worker_session.id,
+            payload={
+                "summary": "Documentation work is waiting for the active backend task to settle.",
+                "reason": "waiting_on_dependencies",
+            },
+        ),
+        EventCreate(
+            category=EventCategory.REVIEW,
+            event_type="review.created",
+            level=EventLevel.INFO,
+            source=source,
+            project_id=project_id,
+            task_id=review_task.id,
+            session_id=review_worker_session.id,
+            payload={
+                "summary": "Approval package is ready with changed files and captured checks.",
+                "review_id": str(review_id),
+            },
+        ),
+    ]
+    for event in seeded_events:
+        event_service.record_event(event)
 
 
 def _assign_demo_tasks(

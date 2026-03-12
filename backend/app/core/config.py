@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "Orchestrator API"
+    app_name: str = "Poulpe Portfolio API"
     app_version: str = "0.1.0"
     api_prefix: str = "/api/v1"
     environment: str = "development"
@@ -24,14 +24,24 @@ class Settings(BaseSettings):
     cors_allowed_origins: list[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:3050",
+        "http://127.0.0.1:3050",
     ]
     orchestrator_repos_root: Path = Path(".orchestrator/repos")
     orchestrator_workspaces_root: Path = Path(".orchestrator/workspaces")
     session_heartbeat_interval_seconds: float = 2.0
     session_stop_grace_seconds: float = 1.5
-    codex_simulation_mode_default: bool = True
+    codex_simulation_mode_default: bool = False
+    codex_runtime_command_template: str = "codex"
+    claude_code_runtime_command_template: str = "claude"
+    portfolio_automation_enabled: bool = True
+    portfolio_automation_interval_seconds: float = 5.0
     orchestrator_idle_session_seconds: float = 120.0
     orchestrator_summary_request_cooldown_seconds: float = 120.0
+    orchestrator_manager_review_enabled: bool = True
+    orchestrator_manager_review_max_rounds: int = 2
 
     model_config = SettingsConfigDict(
         env_file=".env",

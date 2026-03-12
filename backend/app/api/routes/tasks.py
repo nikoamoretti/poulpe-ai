@@ -14,7 +14,7 @@ from app.schemas.task import (
 from app.services.orchestration_service import OrchestratorService
 from app.services.task_service import TaskService
 
-router = APIRouter(prefix="/tasks", tags=["tasks"])
+router = APIRouter(prefix="/tasks", tags=["legacy-tasks"])
 
 
 @router.get("", response_model=list[TaskRead])

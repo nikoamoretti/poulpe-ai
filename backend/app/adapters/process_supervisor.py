@@ -144,7 +144,10 @@ class ProcessSupervisorAdapter:
         with handle.lock:
             if not handle.snapshot.running or handle.snapshot.pid is None:
                 raise ValidationError(f"Session {session_id} is not running.")
-            os.write(handle.master_fd, b"\x03\n")
+            try:
+                os.killpg(handle.snapshot.pid, signal.SIGINT)
+            except ProcessLookupError:
+                handle.snapshot.running = False
             self._mark_heartbeat(handle)
 
     def stop(self, session_id: str) -> ProcessRuntimeSnapshot | None:
@@ -156,7 +159,10 @@ class ProcessSupervisorAdapter:
             if not handle.snapshot.running or handle.snapshot.pid is None:
                 return self._copy_snapshot(handle.snapshot)
             handle.snapshot.stop_requested = True
-            os.killpg(handle.snapshot.pid, signal.SIGTERM)
+            try:
+                os.killpg(handle.snapshot.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                handle.snapshot.running = False
 
         deadline = time.monotonic() + self.stop_grace_seconds
         while time.monotonic() < deadline:
@@ -166,7 +172,10 @@ class ProcessSupervisorAdapter:
 
         with handle.lock:
             if handle.process.poll() is None and handle.snapshot.pid is not None:
-                os.killpg(handle.snapshot.pid, signal.SIGKILL)
+                try:
+                    os.killpg(handle.snapshot.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    handle.snapshot.running = False
         return self.get_status(session_id)
 
     def get_status(self, session_id: str) -> ProcessRuntimeSnapshot | None:
@@ -240,6 +249,13 @@ class ProcessSupervisorAdapter:
 
     def _wait_loop(self, handle: _ProcessHandle) -> None:
         exit_code = handle.process.wait()
+        current_thread = threading.current_thread()
+        # Give stdout/stderr reader threads a moment to flush the final chunks
+        # before downstream code observes the session as completed.
+        for thread in handle.threads:
+            if thread is current_thread:
+                continue
+            thread.join(timeout=1.0)
         ended_at = datetime.now(UTC)
         with handle.lock:
             handle.snapshot.running = False

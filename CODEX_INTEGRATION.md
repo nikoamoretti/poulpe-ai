@@ -1,102 +1,59 @@
-# Real Codex Integration Notes
+# Codex Integration
 
-The current v0 runtime is built so a real Codex CLI or terminal process can replace the dev simulator without changing the rest of the system.
+This repo now has one real worker execution path backed by the local Codex CLI.
 
-## What is already real
+## What is real today
 
-These pieces are not mocked:
-- PTY/subprocess lifecycle supervision in `backend/app/adapters/process_supervisor.py`
-- session lifecycle persistence in `backend/app/services/session_supervisor.py`
-- transcript chunk storage
-- structured event parsing and persistence
-- websocket fan-out for events
-- git worktree provisioning
-- review packaging and orchestrator state transitions
+- worker sessions can launch a real local Codex process
+- each worker still gets its own git branch and linked git worktree
+- the backend generates a task packet from the task, scope, and workspace state
+- transcript chunks are persisted during execution
+- structured events are extracted from the Codex bridge output
+- the orchestrator can hand completed work off into the review pipeline
 
-## What is still simulated
-
-By default, `codex_local` launches:
-
-```text
-python -m app.dev.codex_session_simulator
-```
-
-instead of a real Codex binary.
-
-That behavior lives in:
+The main files are:
 - `backend/app/adapters/codex_local.py`
+- `backend/app/runtime/codex_exec_worker.py`
+- `backend/app/services/task_packet_service.py`
+- `backend/app/services/session_supervisor.py`
 
-## Primary swap point
+## Runtime contract
 
-The main integration seam is:
-- `CodexLocalAdapter._build_command()` in `backend/app/adapters/codex_local.py`
-
-Today it does:
-- dev simulator command construction when `simulation_mode=True`
-- shell-splitting of the provided real command when `simulation_mode=False`
-
-To wire in a real Codex process, replace the real-command branch with the actual CLI invocation contract you want to support.
-
-## Process contract already expected by the runtime
-
-The adapter layer already supports:
-- `start(session_config, callbacks)`
-- `send(session_id, message)`
-- `interrupt(session_id)`
-- `stop(session_id)`
-- `get_status(session_id)`
-
-That contract is defined in:
-- `backend/app/adapters/agent_adapter.py`
-
-As long as the real Codex integration can honor that contract, the rest of the system does not need to change.
-
-## Required work to plug in a real Codex process
-
-1. Replace the simulator launch command in `codex_local.py` with the real Codex CLI command.
-2. Decide how stdin messaging works for Codex:
-   - plain stdin text
-   - slash-command style protocol
-   - JSON lines
-3. Confirm interrupt semantics:
-   - whether `SIGINT` is enough
-   - whether a special stdin command is required
-4. Confirm environment/bootstrap requirements:
-   - auth tokens
-   - config files
-   - model selection
-   - working-directory expectations
-5. Ensure the real process emits the structured event block format:
+The real Codex path uses:
 
 ```text
-[[EVENT]]
-{"type":"progress","summary":"implemented parser","progress":40}
-[[/EVENT]]
+codex exec --json --full-auto -C <workspace> "<generated task packet>"
 ```
 
-6. Add one integration test that launches the real binary and exercises:
-   - start
-   - send
-   - interrupt
-   - stop
-   - transcript persistence
-   - structured event parsing
+The bridge process in `backend/app/runtime/codex_exec_worker.py` is responsible for:
+- launching Codex in the isolated workspace
+- forwarding Codex text into the transcript stream
+- translating Codex JSONL items into structured event blocks
+- surfacing verification runs and completion/error states
 
-## Why the rest of the backend can stay unchanged
+## What the backend sends to Codex
 
-These layers are already adapter-agnostic:
-- `SessionService` creates session records and launch plans
-- `SessionSupervisor` persists runtime state and transcript/event records
-- `OrchestratorService` reacts to normalized session and task state
-- `ReviewService` consumes workspace diffs and check artifacts
+`TaskPacketService` builds a startup packet with:
+- the worker prompt template
+- project and task identity
+- workspace path and branch information
+- scope restrictions
+- acceptance criteria
+- explicit instructions to emit `[[EVENT]]` JSON blocks
 
-That means the real Codex swap is mostly a runtime adapter job, not a full orchestration rewrite.
+That startup packet is persisted as a transcript input chunk so startup behavior is inspectable.
 
-## Prompt contract expectations
+## Current limits
 
-The prompt templates in:
-- `backend/app/prompts/worker.md`
-- `backend/app/prompts/reviewer.md`
-- `backend/app/prompts/manager.md`
+- live follow-up messaging is not supported for real Codex exec sessions yet
+- reviewer and manager sessions still use the simulated runtime
+- Claude Code is still future or experimental only
+- merge to the main branch is still not implemented
 
-already instruct sessions to emit structured event blocks. A real Codex process should receive those prompts unchanged or with only minimal transport-specific wrapping.
+## Future Claude adapter seam
+
+The current architecture is ready for a future `ClaudeCodeAdapter`:
+- `AgentAdapter` defines the runtime contract
+- `SessionSupervisor` is runtime-agnostic once it has an adapter and startup packet
+- `TaskPacketService` can be reused or split into provider-specific packet builders
+- `codex_exec_worker.py` shows the pattern for turning provider-native output into transcript plus structured events

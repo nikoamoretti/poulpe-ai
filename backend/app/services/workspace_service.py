@@ -57,13 +57,20 @@ class WorkspaceService:
 
     def provision_session_workspace(self, session_id: UUID) -> WorkspaceStatusRead:
         session = self._get_session(session_id)
-        if session.role != SessionRole.WORKER or session.task_id is None:
-            raise ValidationError("Only worker sessions with a task_id can provision a workspace.")
+        if session.role != SessionRole.WORKER:
+            raise ValidationError("Only worker sessions can provision a workspace.")
+        if session.project_id is None:
+            raise ValidationError("Worker sessions require a project_id to provision a workspace.")
 
         project = self._get_project(session.project_id)
-        task = self._get_task(session.task_id)
+        task = self._get_task(session.task_id) if session.task_id is not None else None
         repo_info = self.repo_inspector.inspect(project.repo_path, project.default_branch)
-        workspace = self._ensure_workspace_record(session=session, task=task, project=project, repo_commit=repo_info.current_commit)
+        workspace = self._ensure_workspace_record(
+            session=session,
+            task=task,
+            project=project,
+            repo_commit=repo_info.current_commit,
+        )
 
         workspace_path = Path(workspace.workspace_path)
         if workspace.status in {WorkspaceStatus.READY, WorkspaceStatus.DIRTY} and workspace_path.exists():
@@ -261,7 +268,7 @@ class WorkspaceService:
         self,
         *,
         session: SessionModel,
-        task: Task,
+        task: Task | None,
         project: Project,
         repo_commit: str | None,
     ) -> Workspace:
@@ -271,8 +278,9 @@ class WorkspaceService:
 
         plan = self.worktree_manager.plan_workspace(
             project_slug=project.slug,
+            project_id=project.id,
             role=session.role,
-            task_id=task.id,
+            task_id=task.id if task is not None else None,
             session_id=session.id,
             base_branch=project.default_branch,
         )
