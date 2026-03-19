@@ -35,3 +35,4 @@ backend/.orchestrator/
 
 # Temporary frontend design artifacts
 frontend/.*.png
+.vercel
