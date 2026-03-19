@@ -21,6 +21,8 @@ export const metadata: Metadata = {
   description: "Program-manager console for supervising independent project sessions.",
 };
 
+const hasClerkKey = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -36,8 +38,8 @@ export default function RootLayout({
         />
       </head>
       <body className={`${display.variable} ${mono.variable}`}>
-          <ClerkProvider>{children}</ClerkProvider>
-        </body>
+        {hasClerkKey ? <ClerkProvider>{children}</ClerkProvider> : children}
+      </body>
     </html>
   );
 }
