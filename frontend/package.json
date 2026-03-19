@@ -8,14 +8,21 @@
     "start": "next start -H 0.0.0.0 -p 3000"
   },
   "dependencies": {
+    "@clerk/nextjs": "^7.0.5",
+    "@stripe/stripe-js": "^8.11.0",
     "next": "^15.2.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "stripe": "^20.4.1"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.2",
     "@types/node": "^22.13.0",
     "@types/react": "^19.0.8",
     "@types/react-dom": "^19.0.3",
+    "autoprefixer": "^10.4.27",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2",
     "typescript": "^5.8.2"
   }
 }

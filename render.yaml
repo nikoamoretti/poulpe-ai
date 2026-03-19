@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: poulpe-ai-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: poulpe-ai-db
+          property: connectionString
+      - key: REDIS_URL
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+      - key: AUTO_CREATE_SCHEMA
+        value: "true"
+      - key: STARTUP_CHECK_CONNECTIONS
+        value: "false"
+      - key: REDIS_ENABLED
+        value: "false"
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+databases:
+  - name: poulpe-ai-db
+    plan: free
+    databaseName: orchestrator
+    user: orchestrator

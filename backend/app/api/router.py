@@ -1,9 +1,10 @@
 from fastapi import APIRouter
 
-from app.api.routes import events, health, orchestrator, portfolios, projects, reviews, runtime, sessions, tasks, workspaces
+from app.api.routes import billing, events, health, orchestrator, portfolios, projects, reviews, runtime, sessions, tasks, workspaces
 
 api_router = APIRouter()
 api_router.include_router(health.router)
+api_router.include_router(billing.router)
 api_router.include_router(portfolios.router)
 api_router.include_router(projects.router)
 api_router.include_router(tasks.router)
