@@ -1,5 +1,9 @@
 # Poulpe Portfolio Console
 
+**Live frontend:** https://frontend-yard-logix.vercel.app
+
+> Auth (Clerk) and billing (Stripe) are integrated in code but require environment variables to be wired in before they activate. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the step-by-step setup guide.
+
 Poulpe is a local-first control plane for one program manager and several independent coding-agent projects.
 
 The primary product model is:
