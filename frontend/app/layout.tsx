@@ -1,3 +1,4 @@
+import { ClerkProvider } from "@clerk/nextjs";
 import type { Metadata } from "next";
 import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
 import type { ReactNode } from "react";
@@ -20,6 +21,8 @@ export const metadata: Metadata = {
   description: "Program-manager console for supervising independent project sessions.",
 };
 
+const hasClerkKey = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -34,7 +37,9 @@ export default function RootLayout({
           }}
         />
       </head>
-      <body className={`${display.variable} ${mono.variable}`}>{children}</body>
+      <body className={`${display.variable} ${mono.variable}`}>
+        {hasClerkKey ? <ClerkProvider>{children}</ClerkProvider> : children}
+      </body>
     </html>
   );
 }
