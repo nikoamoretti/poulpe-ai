@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.core.container import ServiceContainer
 from app.core.database import get_db as get_database_session
+from app.services.business_cycle_service import BusinessCycleService
+from app.services.business_service import BusinessService
 from app.services.event_service import EventService
 from app.services.orchestration_service import OrchestratorService
 from app.services.portfolio_automation_service import PortfolioAutomationService
@@ -156,4 +158,23 @@ def get_review_service(
         db=db,
         event_service=event_service,
         workspace_service=workspace_service,
+    )
+
+
+def get_business_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+) -> BusinessService:
+    return BusinessService(db=db, event_service=event_service)
+
+
+def get_business_cycle_service(
+    db: Session = Depends(get_db),
+    event_service: EventService = Depends(get_event_service),
+    container: ServiceContainer = Depends(get_container),
+) -> BusinessCycleService:
+    return BusinessCycleService(
+        db=db,
+        settings=container.settings,
+        event_service=event_service,
     )

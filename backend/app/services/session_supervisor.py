@@ -206,17 +206,33 @@ class SessionSupervisor:
             send_initial_message_after_start = False
             post_start_message = None
         elif session_role == SessionRole.MANAGER:
-            if session_kind == "portfolio_manager_turn":
+            if session_kind == "business_ceo_daily_cycle":
                 try:
-                    turn_packet = self.task_packet_service.build_portfolio_manager_turn_packet(session_id)
+                    startup_message = self.task_packet_service.build_business_ceo_daily_cycle_packet(session_id)
+                except Exception as exc:
+                    self._mark_start_failed(session_id, exc)
+                    raise
+                send_initial_message_after_start = False
+                post_start_message = None
+            elif session_kind in ("portfolio_manager_turn", "portfolio_planning_turn"):
+                try:
+                    if session_kind == "portfolio_planning_turn":
+                        turn_packet = self.task_packet_service.build_portfolio_planning_packet(session_id)
+                    else:
+                        turn_packet = self.task_packet_service.build_portfolio_manager_turn_packet(session_id)
                 except Exception as exc:
                     self._mark_start_failed(session_id, exc)
                     raise
                 if runtime_simulated:
                     try:
-                        post_start_message = (
-                            self.task_packet_service.build_portfolio_manager_turn_simulation_message(session_id)
-                        )
+                        if session_kind == "portfolio_planning_turn":
+                            post_start_message = (
+                                self.task_packet_service.build_portfolio_planning_simulation_message(session_id)
+                            )
+                        else:
+                            post_start_message = (
+                                self.task_packet_service.build_portfolio_manager_turn_simulation_message(session_id)
+                            )
                     except Exception as exc:
                         self._mark_start_failed(session_id, exc)
                         raise
@@ -261,7 +277,7 @@ class SessionSupervisor:
             session_command,
             (
                 "generated"
-                if startup_message or session_kind == "portfolio_manager_turn"
+                if startup_message or session_kind in ("portfolio_manager_turn", "portfolio_planning_turn")
                 else ("operator" if post_start_message else "none")
             ),
         )
@@ -328,6 +344,19 @@ class SessionSupervisor:
                 )
             )
 
+        # Inject MCP bridge env vars for worker sessions so Codex can
+        # call ask_manager() / report_progress() / claim_completion().
+        session_env: dict[str, str] = {}
+        if session_role == SessionRole.WORKER and project_id is not None:
+            api_base = self.settings.api_base_url or "http://localhost:8000/api/v1"
+            session_env["POULPE_API_URL"] = api_base
+            session_env["POULPE_PROJECT_ID"] = str(project_id)
+            session_env["POULPE_SESSION_ID"] = session_id_str
+            with self.database.session() as db:
+                proj = db.get(Project, project_id)
+                if proj and proj.portfolio_id:
+                    session_env["POULPE_PORTFOLIO_ID"] = str(proj.portfolio_id)
+
         config = AgentSessionConfig(
             session_id=session_id_str,
             role=session_role,
@@ -337,6 +366,7 @@ class SessionSupervisor:
             model=session_model,
             simulation_mode=simulation_mode,
             startup_message=startup_message,
+            env=session_env,
             metadata=session_metadata,
         )
 

@@ -93,6 +93,7 @@ class ProjectService:
 
         project = Project(
             portfolio_id=payload.portfolio_id,
+            parent_project_id=payload.parent_project_id,
             name=payload.name,
             slug=self._build_unique_slug(payload.name),
             repo_path=repo_info.repo_path,

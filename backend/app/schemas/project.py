@@ -10,6 +10,7 @@ from app.schemas.common import ORMModel
 
 class ProjectCreate(ORMModel):
     portfolio_id: UUID | None = None
+    parent_project_id: UUID | None = None
     name: str
     repo_path: str | None = None
     create_repo: bool = False
@@ -21,6 +22,7 @@ class ProjectCreate(ORMModel):
 class ProjectRead(ORMModel):
     id: UUID
     portfolio_id: UUID | None = None
+    parent_project_id: UUID | None = None
     name: str
     slug: str
     repo_path: str

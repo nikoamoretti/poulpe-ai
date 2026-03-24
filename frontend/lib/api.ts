@@ -433,6 +433,73 @@ export async function listProjectEvents(projectId: string, limit = 60): Promise<
   });
 }
 
+export type FileEntry = {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number | null;
+};
+
+export type FileContent = {
+  path: string;
+  content: string;
+  size: number;
+  mime_type: string;
+};
+
+export async function listProjectFiles(
+  projectId: string,
+  path = "",
+): Promise<FileEntry[]> {
+  return requestJson<FileEntry[]>(`/api/v1/projects/${projectId}/files`, {
+    query: { path: path || null },
+  });
+}
+
+export async function getProjectFileContent(
+  projectId: string,
+  path: string,
+): Promise<FileContent> {
+  return requestJson<FileContent>(`/api/v1/projects/${projectId}/files/content`, {
+    query: { path },
+  });
+}
+
+export type PreviewInfo = {
+  available: boolean;
+  entry_file: string | null;
+  preview_url: string | null;
+  kind: string | null;
+};
+
+export type GitHubPushResult = {
+  success: boolean;
+  repo_url: string | null;
+  error: string | null;
+};
+
+export async function getPreviewInfo(projectId: string): Promise<PreviewInfo> {
+  return requestJson<PreviewInfo>(`/api/v1/projects/${projectId}/files/preview-info`);
+}
+
+export async function pushToGitHub(
+  projectId: string,
+  options?: { repo_name?: string; private?: boolean; org?: string },
+): Promise<GitHubPushResult> {
+  return requestJson<GitHubPushResult>(`/api/v1/projects/${projectId}/files/push-github`, {
+    method: "POST",
+    body: JSON.stringify({
+      repo_name: options?.repo_name ?? null,
+      private: options?.private ?? true,
+      org: options?.org ?? null,
+    }),
+  });
+}
+
+export function getRawFileUrl(projectId: string, filePath: string): string {
+  return new URL(`/api/v1/projects/${projectId}/files/raw/${filePath}`, apiBaseUrl).toString();
+}
+
 export async function triggerOrchestratorTick(projectId: string): Promise<{
   started_at: string;
   completed_at: string;

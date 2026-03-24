@@ -52,3 +52,11 @@ class ProjectCheckpointRespondRequest(ORMModel):
     action: ProjectCheckpointAction
     message: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectCheckpointCreateRequest(ORMModel):
+    project_id: UUID
+    session_id: UUID | None = None
+    kind: ProjectCheckpointKind
+    summary: str
+    details: dict[str, Any] = Field(default_factory=dict)

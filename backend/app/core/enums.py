@@ -135,3 +135,25 @@ class ProjectCheckpointAction(StrEnum):
     APPROVE = "approve"
     REQUEST_CHANGES = "request_changes"
     DISMISS = "dismiss"
+
+
+class BusinessStatus(StrEnum):
+    SETUP = "setup"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class BusinessType(StrEnum):
+    SAAS = "saas"
+    INFO_PRODUCT = "info_product"
+    TOOL = "tool"
+    MARKETPLACE = "marketplace"
+    API = "api"
+
+
+class BusinessCycleStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"

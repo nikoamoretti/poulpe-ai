@@ -55,6 +55,7 @@ export type ArtifactKind =
 export type Project = {
   id: string;
   portfolio_id: string | null;
+  parent_project_id: string | null;
   name: string;
   slug: string;
   repo_path: string;

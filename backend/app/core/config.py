@@ -36,12 +36,15 @@ class Settings(BaseSettings):
     codex_simulation_mode_default: bool = False
     codex_runtime_command_template: str = "codex"
     claude_code_runtime_command_template: str = "claude"
+    api_base_url: str = "http://localhost:8000/api/v1"
     portfolio_automation_enabled: bool = True
     portfolio_automation_interval_seconds: float = 5.0
     orchestrator_idle_session_seconds: float = 120.0
     orchestrator_summary_request_cooldown_seconds: float = 120.0
     orchestrator_manager_review_enabled: bool = True
     orchestrator_manager_review_max_rounds: int = 2
+    business_cycle_enabled: bool = True
+    business_cycle_check_interval_seconds: float = 60.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

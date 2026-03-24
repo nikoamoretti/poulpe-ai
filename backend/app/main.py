@@ -30,7 +30,9 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         container = build_container(settings)
         automation_task: asyncio.Task[None] | None = None
+        business_cycle_task: asyncio.Task[None] | None = None
         automation_stop = asyncio.Event()
+        business_cycle_stop = asyncio.Event()
         container.ensure_local_dirs()
         if settings.auto_create_schema:
             Base.metadata.create_all(container.database.engine)
@@ -72,12 +74,56 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
 
         if settings.portfolio_automation_enabled:
             automation_task = asyncio.create_task(portfolio_automation_loop())
+
+        async def business_daily_cycle_loop() -> None:
+            """Check for cron-triggered cycles and advance running ones."""
+            from app.services.business_cycle_service import BusinessCycleService
+            from app.services.event_service import EventService
+
+            while not business_cycle_stop.is_set():
+                try:
+                    def _run_business_tick() -> None:
+                        # 1. Check if any cron schedules need new cycles
+                        with container.database.session() as db:
+                            event_svc = EventService(
+                                db=db,
+                                redis_bus=container.redis_bus,
+                                event_broker=container.event_broker,
+                            )
+                            cycle_svc = BusinessCycleService(
+                                db=db,
+                                settings=settings,
+                                event_service=event_svc,
+                            )
+                            cycle_svc.check_and_trigger()
+                        # 2. Advance all active business cycles
+                        container.business_orchestration.tick_all()
+
+                    await asyncio.to_thread(_run_business_tick)
+                except Exception:
+                    logger.exception("business daily cycle loop iteration failed")
+                try:
+                    await asyncio.wait_for(
+                        business_cycle_stop.wait(),
+                        timeout=settings.business_cycle_check_interval_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+        if settings.business_cycle_enabled:
+            business_cycle_task = asyncio.create_task(business_daily_cycle_loop())
+
         yield
         automation_stop.set()
+        business_cycle_stop.set()
         if automation_task is not None:
             automation_task.cancel()
             with suppress(asyncio.CancelledError):
                 await automation_task
+        if business_cycle_task is not None:
+            business_cycle_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await business_cycle_task
         logger.info("portfolio api shutting down")
         container.shutdown()
 

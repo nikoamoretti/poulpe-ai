@@ -9,6 +9,8 @@ from sqlalchemy import select
 from app.core.database import DatabaseManager
 from app.core.enums import SessionRole
 from app.core.errors import NotFoundError, ValidationError
+from app.models.business import Business
+from app.models.business_cycle import BusinessCycle
 from app.models.portfolio import Portfolio
 from app.models.project import Project
 from app.models.project_checkpoint import ProjectCheckpoint
@@ -20,14 +22,19 @@ from app.models.workspace import Workspace
 class TaskPacketService:
     def __init__(self, database: DatabaseManager) -> None:
         self.database = database
-        self.worker_prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "worker.md"
-        self.project_worker_prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "project_worker.md"
-        self.manager_prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "manager.md"
-        self.portfolio_manager_prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "portfolio_manager.md"
-        self.portfolio_manager_turn_prompt_path = (
-            Path(__file__).resolve().parents[1] / "prompts" / "portfolio_manager_turn.md"
-        )
-        self.manager_review_prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "manager_review.md"
+        self._prompts_dir = Path(__file__).resolve().parents[1] / "prompts"
+        self.worker_prompt_path = self._prompts_dir / "worker.md"
+        self.project_worker_prompt_path = self._prompts_dir / "project_worker.md"
+        self.manager_prompt_path = self._prompts_dir / "manager.md"
+        self.portfolio_manager_prompt_path = self._prompts_dir / "portfolio_manager.md"
+        self.portfolio_manager_turn_prompt_path = self._prompts_dir / "portfolio_manager_turn.md"
+        self.portfolio_manager_planning_prompt_path = self._prompts_dir / "portfolio_manager_planning.md"
+        self.manager_review_prompt_path = self._prompts_dir / "manager_review.md"
+        self.business_ceo_prompt_path = self._prompts_dir / "business_ceo.md"
+        self.business_ceo_daily_cycle_prompt_path = self._prompts_dir / "business_ceo_daily_cycle.md"
+        self.business_engineer_prompt_path = self._prompts_dir / "business_engineer.md"
+        self.business_researcher_prompt_path = self._prompts_dir / "business_researcher.md"
+        self.business_marketer_prompt_path = self._prompts_dir / "business_marketer.md"
 
     def build_manager_packet(
         self,
@@ -171,6 +178,87 @@ class TaskPacketService:
     def build_portfolio_manager_turn_simulation_message(self, session_id: UUID) -> str:
         _, _, _, machine_context = self._portfolio_manager_turn_context(session_id)
         return f"PORTFOLIO_MANAGER_TURN_JSON: {json.dumps(machine_context, sort_keys=True)}"
+
+    def build_portfolio_planning_packet(self, session_id: UUID) -> str:
+        """Build the prompt for a portfolio planning turn (goal decomposition)."""
+        with self.database.session() as db:
+            session = db.get(SessionModel, session_id)
+            if session is None:
+                raise NotFoundError(f"Session not found: {session_id}")
+            if session.role != SessionRole.MANAGER or session.portfolio_id is None:
+                raise ValidationError("Only portfolio manager sessions support planning packets.")
+
+            portfolio = db.get(Portfolio, session.portfolio_id)
+            if portfolio is None:
+                raise NotFoundError(f"Portfolio not found: {session.portfolio_id}")
+
+            existing_projects = db.scalars(
+                select(Project)
+                .where(Project.portfolio_id == portfolio.id)
+                .order_by(Project.created_at.asc())
+            ).all()
+
+        planning_prompt = self.portfolio_manager_planning_prompt_path.read_text(encoding="utf-8").strip()
+
+        machine_context = {
+            "portfolio_id": str(portfolio.id),
+            "portfolio_name": portfolio.name,
+            "portfolio_goal": portfolio.goal,
+            "existing_project_count": len(existing_projects),
+        }
+
+        lines = [
+            f"PORTFOLIO_PLANNING_JSON: {json.dumps(machine_context, sort_keys=True)}",
+            planning_prompt,
+            "",
+            "---",
+            "",
+            "Portfolio:",
+            f"Name: {portfolio.name}",
+            f"Goal: {portfolio.goal or '(none provided)'}",
+            "",
+        ]
+
+        if existing_projects:
+            lines.append("Existing projects (already created):")
+            for project in existing_projects:
+                lines.extend([
+                    f"- {project.name}: {project.objective[:200]}",
+                ])
+            lines.append("")
+
+        lines.extend([
+            "Analyze the portfolio goal above.",
+            "If it requires multiple independent workstreams, decompose it into sub-projects.",
+            "If it's simple enough for one worker, emit single_project.",
+            "",
+            "Required output:",
+            "Emit exactly one final complete event with this shape:",
+            "",
+            'For decomposition:',
+            '[[EVENT]] {"type":"complete","summary":"Decomposed into N sub-projects","result":"decompose","projects":[{"name":"...","objective":"..."},...],"details":{"notes":"optional"}} [[/EVENT]]',
+            "",
+            'For single project:',
+            '[[EVENT]] {"type":"complete","summary":"Goal suitable for single worker","result":"single_project","project":{"name":"...","objective":"..."},"details":{"notes":"optional"}} [[/EVENT]]',
+            "",
+            "Do not implement code. Analyze, decide, and stop.",
+        ])
+        return "\n".join(lines).strip() + "\n"
+
+    def build_portfolio_planning_simulation_message(self, session_id: UUID) -> str:
+        with self.database.session() as db:
+            session = db.get(SessionModel, session_id)
+            if session is None:
+                raise NotFoundError(f"Session not found: {session_id}")
+            portfolio = db.get(Portfolio, session.portfolio_id)
+            if portfolio is None:
+                raise NotFoundError(f"Portfolio not found: {session.portfolio_id}")
+        machine_context = {
+            "portfolio_id": str(portfolio.id),
+            "portfolio_name": portfolio.name,
+            "portfolio_goal": portfolio.goal,
+        }
+        return f"PORTFOLIO_PLANNING_JSON: {json.dumps(machine_context, sort_keys=True)}"
 
     def _portfolio_manager_turn_context(
         self,
@@ -450,6 +538,144 @@ class TaskPacketService:
             "```",
             "",
             "Review this diff against the acceptance criteria and emit your verdict.",
+        ])
+        return "\n".join(lines).strip() + "\n"
+
+    # ── Business CEO packets ──────────────────────────────────────────
+
+    def build_business_ceo_daily_cycle_packet(
+        self,
+        session_id: UUID,
+    ) -> str:
+        """Build the prompt for a CEO daily cycle turn."""
+        with self.database.session() as db:
+            session = db.get(SessionModel, session_id)
+            if session is None:
+                raise NotFoundError(f"Session not found: {session_id}")
+
+            metadata = dict(session.metadata_json)
+            business_id_str = str(
+                metadata.get("business_id")
+                or (metadata.get("automation", {}) or {}).get("business_id")
+                or ""
+            ).strip()
+            if not business_id_str:
+                raise ValidationError(f"CEO session {session_id} is missing a business_id.")
+
+            business = db.get(Business, UUID(business_id_str))
+            if business is None:
+                raise NotFoundError(f"Business not found: {business_id_str}")
+
+            portfolio = db.get(Portfolio, business.portfolio_id)
+
+            cycle_id_str = str(metadata.get("cycle_id", "")).strip()
+            cycle = db.get(BusinessCycle, UUID(cycle_id_str)) if cycle_id_str else None
+
+            # Get last completed cycle for "yesterday's results"
+            from sqlalchemy import select
+            from app.core.enums import BusinessCycleStatus
+
+            last_cycle = db.scalar(
+                select(BusinessCycle)
+                .where(
+                    BusinessCycle.business_id == business.id,
+                    BusinessCycle.status == BusinessCycleStatus.COMPLETED,
+                )
+                .order_by(BusinessCycle.created_at.desc())
+                .limit(1)
+            )
+
+        ceo_prompt = self.business_ceo_prompt_path.read_text(encoding="utf-8").strip()
+        cycle_prompt = self.business_ceo_daily_cycle_prompt_path.read_text(encoding="utf-8").strip()
+
+        machine_context = {
+            "business_id": str(business.id),
+            "business_name": business.name,
+            "business_type": business.business_type,
+            "status": business.status,
+            "cycle_id": str(cycle.id) if cycle else None,
+        }
+
+        lines = [
+            f"BUSINESS_CEO_DAILY_CYCLE_JSON: {json.dumps(machine_context, sort_keys=True)}",
+            ceo_prompt,
+            "",
+            "---",
+            "",
+            cycle_prompt,
+            "",
+            "---",
+            "",
+            "Business:",
+            f"Name: {business.name}",
+            f"Type: {business.business_type}",
+            f"Description: {business.description or '(none)'}",
+            f"Status: {business.status}",
+            f"Domain: {business.domain or '(not set)'}",
+            "",
+            "Budget:",
+            f"Monthly budget: ${business.budget_monthly_usd}",
+            f"Total revenue: ${business.total_revenue_usd}",
+            f"Total cost: ${business.total_cost_usd}",
+            "",
+            "Active agent types:",
+        ]
+        for agent_type in business.active_agent_types:
+            lines.append(f"- {agent_type}")
+        if not business.active_agent_types:
+            lines.append("- (none configured)")
+
+        # Inject business metadata (target audience, value prop, competitors, etc.)
+        biz_meta = business.metadata_json
+        if biz_meta:
+            lines.extend(["", "Business context:"])
+            for key, value in biz_meta.items():
+                if isinstance(value, list):
+                    lines.append(f"  {key}: {', '.join(str(v) for v in value)}")
+                else:
+                    lines.append(f"  {key}: {value}")
+
+        lines.extend([
+            "",
+            "Current metrics snapshot:",
+            json.dumps(business.metrics_snapshot, indent=2, default=str),
+            "",
+            "Infrastructure state:",
+            json.dumps(business.infra_state, indent=2, default=str),
+        ])
+
+        if portfolio:
+            lines.extend([
+                "",
+                f"Portfolio: {portfolio.name}",
+                f"Portfolio goal: {portfolio.goal or '(none)'}",
+            ])
+
+        if last_cycle:
+            lines.extend([
+                "",
+                "Last completed cycle:",
+                f"Date: {last_cycle.cycle_date}",
+                f"CEO plan: {json.dumps(last_cycle.ceo_plan, indent=2, default=str)}",
+                f"Agent results: {json.dumps(last_cycle.agent_results, indent=2, default=str)}",
+                f"Metrics after: {json.dumps(last_cycle.metrics_after, indent=2, default=str)}",
+            ])
+        else:
+            lines.extend([
+                "",
+                "Last completed cycle: None (this is the first cycle)",
+            ])
+
+        if cycle and cycle.human_feedback:
+            lines.extend([
+                "",
+                "Human feedback for this cycle:",
+                cycle.human_feedback,
+            ])
+
+        lines.extend([
+            "",
+            "Analyze the business state above and produce today's action plan.",
         ])
         return "\n".join(lines).strip() + "\n"
 

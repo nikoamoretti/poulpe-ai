@@ -8,16 +8,26 @@ import {
   createPortfolio,
   createProject,
   getApiHealth,
+  getPreviewInfo,
+  getProjectFileContent,
   getSession,
   listPortfolioInbox,
   listPortfolios,
   listProjectEvents,
+  listProjectFiles,
   listProjects,
   listSessions,
+  pushToGitHub,
   respondToPortfolioCheckpoint,
   sendProjectManagerInstruction,
   startPortfolioManager,
   startProjectExecution,
+} from "@/lib/api";
+import type {
+  FileContent,
+  FileEntry,
+  GitHubPushResult,
+  PreviewInfo,
 } from "@/lib/api";
 import type {
   EventEnvelope,
@@ -30,7 +40,7 @@ import type {
 } from "@/lib/types";
 
 type Flash = { tone: "success" | "danger" | "info"; message: string } | null;
-type MainView = "workspace" | "inbox" | "activity";
+type MainView = "workspace" | "inbox" | "activity" | "deliverables";
 
 type PortfolioBoardData = {
   projects: Project[];
@@ -120,11 +130,11 @@ function eventTitle(event: EventEnvelope): string {
     "portfolio.manager_started": "Manager started",
     "project.created": "Project created",
     "project.execution_started": "Project started",
-    "project.checkpoint_opened": "Manager checkpoint opened",
-    "project.checkpoint_resolved": "Manager checkpoint resolved",
+    "project.checkpoint_opened": "Checkpoint opened",
+    "project.checkpoint_resolved": "Checkpoint resolved",
     "session.start": "Session booted",
     "session.started": "Session started",
-    "session.progress": "Progress update",
+    "session.progress": "Progress",
     "session.question": "Question raised",
     "session.blocked": "Blocked",
     "session.tests_run": "Verification ran",
@@ -133,6 +143,9 @@ function eventTitle(event: EventEnvelope): string {
     "session.error": "Session error",
     "session.failed": "Session failed",
     "worktree.ready": "Workspace ready",
+    "portfolio.planning_turn_started": "Planning started",
+    "portfolio.planning_decomposed": "Goal decomposed",
+    "portfolio.planning_single_project": "Single project created",
   };
   return labels[event.event_type] ?? event.event_type.replaceAll(".", " ");
 }
@@ -145,7 +158,7 @@ function eventDetail(event: EventEnvelope): string {
     asString(payload.note) ??
     asString(payload.reason) ??
     asString(payload.message) ??
-    "No additional detail."
+    ""
   );
 }
 
@@ -223,7 +236,17 @@ export function DashboardShell() {
   });
   const [instructionDraft, setInstructionDraft] = useState("");
   const [checkpointDrafts, setCheckpointDrafts] = useState<Record<string, string>>({});
+  const [deliverableFiles, setDeliverableFiles] = useState<FileEntry[]>([]);
+  const [deliverablePath, setDeliverablePath] = useState("");
+  const [openFile, setOpenFile] = useState<FileContent | null>(null);
+  const [loadingFile, setLoadingFile] = useState(false);
+  const [previewInfo, setPreviewInfo] = useState<PreviewInfo | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
+  const [ghPushResult, setGhPushResult] = useState<GitHubPushResult | null>(null);
+  const [pushingGh, setPushingGh] = useState(false);
   const [, startTransition] = useTransition();
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [showNewPortfolio, setShowNewPortfolio] = useState(false);
 
   const selectedPortfolio =
     portfolios.find((portfolio) => portfolio.id === selectedPortfolioId) ?? null;
@@ -245,51 +268,28 @@ export function DashboardShell() {
     ? inbox.filter((checkpoint) => checkpoint.project_id === selectedProject.id).length
     : 0;
 
-  const workflowSteps = [
-    {
-      title: "Select a portfolio",
-      detail: "Everything lives inside one portfolio.",
-      done: selectedPortfolio !== null,
-    },
-    {
-      title: "Add a project",
-      detail: "Each project gets its own worker session.",
-      done: portfolioProjectCount > 0,
-    },
-    {
-      title: "Start the manager",
-      detail: "The manager handles questions and reviews completion claims.",
-      done: managerSession !== null,
-    },
-    {
-      title: "Start a project session",
-      detail: "Launch the selected project when you are ready to work.",
-      done: activeWorkerCount > 0,
-    },
-  ];
-
   let nextActionTitle = "Create a portfolio";
-  let nextActionDetail = "Start by creating or selecting a portfolio in the left rail.";
+  let nextActionDetail = "Start by creating a portfolio to group your projects.";
   if (selectedPortfolio) {
-    nextActionTitle = "Add your first project";
-    nextActionDetail = "Create a project from a name, then Poulpe will create its local repo for you.";
+    nextActionTitle = "Add a project";
+    nextActionDetail = "Create a project from a name — Poulpe will set up its local repo.";
   }
   if (selectedPortfolio && portfolioProjectCount > 0) {
-    nextActionTitle = "Start the portfolio manager";
+    nextActionTitle = "Start manager";
     nextActionDetail = "The manager session supervises workers, answers questions, and reviews completions.";
   }
   if (selectedPortfolio && portfolioProjectCount > 0 && managerSession) {
-    nextActionTitle = "Start the selected project";
+    nextActionTitle = "Start a project";
     nextActionDetail = selectedProject
-      ? `Launch ${selectedProject.name} when you want its worker session to start operating.`
-      : "Pick a project card, then start its worker session.";
+      ? `Launch ${selectedProject.name} to begin its worker session.`
+      : "Pick a project, then start its worker session.";
   }
   if (selectedPortfolio && selectedWorker && selectedWorker.status !== "pending") {
-    nextActionTitle = openCheckpointCount > 0 ? "Review the manager inbox" : "Guide the selected project";
+    nextActionTitle = openCheckpointCount > 0 ? "Inbox active" : "Monitor project";
     nextActionDetail =
       openCheckpointCount > 0
-        ? "Open the inbox tab to answer worker questions or approve completion claims."
-        : "Use the selected-project panel to send corrections or new instructions.";
+        ? "Manager is autonomously handling worker checkpoints. Review inbox to observe or override."
+        : "Worker is running. The manager will handle questions automatically.";
   }
 
   useEffect(() => {
@@ -414,6 +414,68 @@ export function DashboardShell() {
     };
   }, [selectedPortfolioId, selectedProjectId, startTransition]);
 
+  // Load deliverable files when tab is active
+  useEffect(() => {
+    if (mainView !== "deliverables" || !selectedProjectId) {
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const [files, preview] = await Promise.all([
+          listProjectFiles(selectedProjectId, deliverablePath),
+          deliverablePath === "" ? getPreviewInfo(selectedProjectId) : Promise.resolve(null),
+        ]);
+        if (!cancelled) {
+          setDeliverableFiles(files);
+          if (preview) setPreviewInfo(preview);
+        }
+      } catch {
+        if (!cancelled) setDeliverableFiles([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [mainView, selectedProjectId, deliverablePath]);
+
+  async function handleOpenFile(filePath: string) {
+    if (!selectedProjectId) return;
+    setLoadingFile(true);
+    try {
+      const content = await getProjectFileContent(selectedProjectId, filePath);
+      setOpenFile(content);
+    } catch {
+      setOpenFile(null);
+    } finally {
+      setLoadingFile(false);
+    }
+  }
+
+  function handleNavigateDir(dirPath: string) {
+    setDeliverablePath(dirPath);
+    setOpenFile(null);
+  }
+
+  async function handlePushGitHub() {
+    if (!selectedProjectId) return;
+    setPushingGh(true);
+    setGhPushResult(null);
+    try {
+      const result = await pushToGitHub(selectedProjectId);
+      setGhPushResult(result);
+    } catch (e) {
+      setGhPushResult({ success: false, repo_url: null, error: String(e) });
+    } finally {
+      setPushingGh(false);
+    }
+  }
+
+  function handleNavigateUp() {
+    const parts = deliverablePath.split("/").filter(Boolean);
+    parts.pop();
+    setDeliverablePath(parts.join("/"));
+    setOpenFile(null);
+  }
+
   async function refreshAfterAction(
     preferredPortfolioId: string | null,
     preferredProjectId: string | null,
@@ -456,6 +518,7 @@ export function DashboardShell() {
     await runAction("Portfolio created", async () => {
       const portfolio = await createPortfolio({ name, goal });
       setPortfolioForm({ name: "", goal: "" });
+      setShowNewPortfolio(false);
       await refreshAfterAction(portfolio.id, null);
     });
   }
@@ -497,6 +560,7 @@ export function DashboardShell() {
         defaultBranch: "main",
         objective: "",
       });
+      setShowNewProject(false);
       await refreshAfterAction(portfolio.id, project.id);
     });
   }
@@ -535,7 +599,7 @@ export function DashboardShell() {
     const message = instructionDraft.trim();
     if (!message) return;
 
-    await runAction("Instruction sent to project", async () => {
+    await runAction("Instruction sent", async () => {
       await sendProjectManagerInstruction({
         projectId: selectedProject.id,
         message,
@@ -575,522 +639,907 @@ export function DashboardShell() {
   const connectionStatus =
     health.status === "ok" ? "ok" : health.status === "loading" ? "connecting" : "error";
 
+  /* ═══════════════════════════════════════════
+     Render
+     ═══════════════════════════════════════════ */
   return (
-    <div className="shell portfolio-shell">
+    <div className="console">
+      {/* ─── Top bar ─── */}
       <header className="topbar">
         <div className="topbar-left">
-          <span className="topbar-dot" data-status={connectionStatus} />
-          <span className="topbar-brand">Poulpe Portfolio Console</span>
-          <span className="topbar-tag">
-            {selectedPortfolio ? selectedPortfolio.slug : "no portfolio"}
-          </span>
-          {refreshing ? <span className="board-live">syncing</span> : null}
+          <span className="con-dot" data-status={connectionStatus} />
+          <span className="brand">POULPE<span>console</span></span>
+          <div className="topbar-divider" />
+          {portfolios.map((portfolio) => (
+            <button
+              key={portfolio.id}
+              className={`pf-chip ${portfolio.id === selectedPortfolioId ? "is-active" : ""}`}
+              type="button"
+              onClick={() => setSelectedPortfolioId(portfolio.id)}
+            >
+              {portfolio.name}
+            </button>
+          ))}
+          <button
+            className="pf-chip is-add"
+            type="button"
+            onClick={() => setShowNewPortfolio(!showNewPortfolio)}
+          >
+            +
+          </button>
+          {refreshing ? <span className="sync-badge">syncing</span> : null}
         </div>
         <div className="topbar-right">
           <ThemeToggle />
         </div>
       </header>
 
-      <main className="portfolio-layout">
-        <aside className="portfolio-sidebar">
-          <section className="sidebar-card sidebar-guide">
-            <div className="section-head">
-              <div>
-                <p className="section-kicker">How to use</p>
-                <h2 className="section-title">4-step flow</h2>
-              </div>
-              <StatusPill tone={statusToneFor(health.status)}>{health.status}</StatusPill>
+      {/* Inline portfolio create form (dropdown under topbar) */}
+      {showNewPortfolio ? (
+        <div className="pf-form-inline">
+          <form
+            style={{ display: "flex", flexDirection: "column", gap: "8px" }}
+            onSubmit={handleCreatePortfolio}
+          >
+            <div className="field">
+              <span className="field-label">Portfolio name</span>
+              <input
+                className="field-input"
+                value={portfolioForm.name}
+                onChange={(e) =>
+                  setPortfolioForm((c) => ({ ...c, name: e.target.value }))
+                }
+                placeholder="Platform modernization"
+              />
             </div>
-            <p className="section-copy">
-              One manager session supervises one independent worker session per project.
+            <div className="field">
+              <span className="field-label">Goal (optional)</span>
+              <textarea
+                className="field-textarea"
+                value={portfolioForm.goal}
+                onChange={(e) =>
+                  setPortfolioForm((c) => ({ ...c, goal: e.target.value }))
+                }
+                rows={2}
+                placeholder="Coordinate and deliver the active projects."
+              />
+            </div>
+            <div style={{ display: "flex", gap: "6px" }}>
+              <button className="btn-accent" disabled={pendingAction !== null} type="submit">
+                Create portfolio
+              </button>
+              <button
+                className="btn-ghost"
+                type="button"
+                onClick={() => setShowNewPortfolio(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {/* ─── Flash ─── */}
+      {flash ? (
+        <div className={`flash-bar is-${flash.tone}`}>{flash.message}</div>
+      ) : null}
+
+      {/* ─── Body ─── */}
+      {loading ? (
+        <div className="loading-state">
+          <div className="spinner" />
+          <span>Connecting to backend&hellip;</span>
+        </div>
+      ) : !selectedPortfolio ? (
+        /* ─── Onboarding (no portfolio) ─── */
+        <div className="onboard">
+          <div className="onboard-card">
+            <h1>Create your first portfolio</h1>
+            <p>
+              A portfolio groups independent coding-agent projects under one
+              manager session. Create one to get started.
             </p>
-            <div className="guide-list">
-              {workflowSteps.map((step, index) => (
-                <div
-                  className={`guide-step ${step.done ? "is-done" : ""}`}
-                  key={step.title}
-                >
-                  <span className="guide-step-index">{index + 1}</span>
-                  <div className="guide-step-body">
-                    <strong>{step.title}</strong>
-                    <span>{step.detail}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="sidebar-card">
-            <div className="section-head">
-              <div>
-                <p className="section-kicker">Portfolios</p>
-                <h2 className="section-title">{portfolios.length}</h2>
-              </div>
-            </div>
-            <div className="portfolio-list">
-              {portfolios.map((portfolio) => {
-                const selected = portfolio.id === selectedPortfolioId;
-                return (
-                  <button
-                    key={portfolio.id}
-                    className={`portfolio-item ${selected ? "is-selected" : ""}`}
-                    type="button"
-                    onClick={() => setSelectedPortfolioId(portfolio.id)}
-                  >
-                    <div className="portfolio-item-head">
-                      <span>{portfolio.name}</span>
-                      <StatusPill tone={statusToneFor(portfolio.status)} compact>
-                        {portfolio.status}
-                      </StatusPill>
-                    </div>
-                    <p>{portfolio.goal || "No portfolio goal recorded yet."}</p>
-                  </button>
-                );
-              })}
-              {portfolios.length === 0 && !loading ? (
-                <div className="empty-block">
-                  Create the first portfolio to start the manager/project model.
-                </div>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="sidebar-card">
-            <div className="section-head">
-              <div>
-                <p className="section-kicker">Create</p>
-                <h2 className="section-title">New portfolio</h2>
-              </div>
-            </div>
-            <form className="stack-form" onSubmit={handleCreatePortfolio}>
-              <label className="field">
-                <span>Name</span>
+            <form
+              style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+              onSubmit={handleCreatePortfolio}
+            >
+              <div className="field">
+                <span className="field-label">Name</span>
                 <input
                   className="field-input"
                   value={portfolioForm.name}
-                  onChange={(event) =>
-                    setPortfolioForm((current) => ({
-                      ...current,
-                      name: event.target.value,
-                    }))
+                  onChange={(e) =>
+                    setPortfolioForm((c) => ({ ...c, name: e.target.value }))
                   }
                   placeholder="Platform modernization"
                 />
-              </label>
-              <label className="field">
-                <span>Goal</span>
+              </div>
+              <div className="field">
+                <span className="field-label">Goal</span>
                 <textarea
                   className="field-textarea"
                   value={portfolioForm.goal}
-                  onChange={(event) =>
-                    setPortfolioForm((current) => ({
-                      ...current,
-                      goal: event.target.value,
-                    }))
+                  onChange={(e) =>
+                    setPortfolioForm((c) => ({ ...c, goal: e.target.value }))
                   }
-                  rows={4}
+                  rows={3}
                   placeholder="Coordinate the active project sessions and bring them to completion."
                 />
-              </label>
-              <button className="button-primary" disabled={pendingAction !== null} type="submit">
+              </div>
+              <button
+                className="btn-accent"
+                disabled={pendingAction !== null}
+                type="submit"
+              >
                 Create portfolio
               </button>
             </form>
-          </section>
-        </aside>
-
-        <section className="portfolio-main">
-          {flash ? (
-            <div className={`flash-banner is-${flash.tone}`}>{flash.message}</div>
-          ) : null}
-
-          {selectedPortfolio ? (
-            <>
-              <section className="hero-card">
-                <div className="hero-copy">
-                  <p className="section-kicker">Selected portfolio</p>
-                  <h1>{selectedPortfolio.name}</h1>
-                  <p>{selectedPortfolio.goal || "No portfolio goal recorded yet."}</p>
-                </div>
-                <div className="hero-stats">
-                  <div className="hero-stat">
-                    <span>Projects</span>
-                    <strong>{portfolioProjectCount}</strong>
-                  </div>
-                  <div className="hero-stat">
-                    <span>Active workers</span>
-                    <strong>{activeWorkerCount}</strong>
-                  </div>
-                  <div className="hero-stat">
-                    <span>Open inbox</span>
-                    <strong>{openCheckpointCount}</strong>
-                  </div>
-                </div>
-                <div className="hero-actions">
-                  <div className="hero-next-step">
-                    <p className="section-kicker">Next recommended action</p>
-                    <h2 className="hero-action-title">{nextActionTitle}</h2>
-                    <p>{nextActionDetail}</p>
-                  </div>
-                  <div className="hero-action-row">
-                    {managerSession ? (
-                      <>
-                        <div className="session-chip">
-                          <span>Manager</span>
-                          <strong>{shortId(managerSession.id)}</strong>
-                          <span>{managerSession.status}</span>
-                        </div>
-                        <button
-                          className="button-ghost"
-                          disabled={pendingAction !== null}
-                          onClick={() => void handleStartManager()}
-                          type="button"
-                        >
-                          Restart manager
-                        </button>
-                      </>
-                    ) : (
-                      <button
-                        className="button-primary"
-                        disabled={pendingAction !== null}
-                        onClick={() => void handleStartManager()}
-                        type="button"
-                      >
-                        Start manager
-                      </button>
-                    )}
-                    {selectedProject && !selectedWorker ? (
-                      <button
-                        className="button-secondary"
-                        disabled={pendingAction !== null}
-                        onClick={() => void handleStartProject(selectedProject)}
-                        type="button"
-                      >
-                        Start selected project
-                      </button>
-                    ) : null}
-                    {openCheckpointCount > 0 ? (
-                      <button
-                        className="button-secondary"
-                        onClick={() => setMainView("inbox")}
-                        type="button"
-                      >
-                        Review inbox
-                      </button>
-                    ) : null}
-                    {selectedProject ? (
-                      <button
-                        className="button-ghost"
-                        onClick={() => setMainView("activity")}
-                        type="button"
-                      >
-                        View activity
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
-              </section>
-
-              <div className="view-switcher">
-                <button
-                  className={`view-tab ${mainView === "workspace" ? "is-active" : ""}`}
-                  onClick={() => setMainView("workspace")}
-                  type="button"
-                >
-                  Workspace
-                </button>
-                <button
-                  className={`view-tab ${mainView === "inbox" ? "is-active" : ""}`}
-                  onClick={() => setMainView("inbox")}
-                  type="button"
-                >
-                  Inbox
-                  <span className="view-tab-count">{openCheckpointCount}</span>
-                </button>
-                <button
-                  className={`view-tab ${mainView === "activity" ? "is-active" : ""}`}
-                  onClick={() => setMainView("activity")}
-                  type="button"
-                >
-                  Activity
-                  <span className="view-tab-count">{selectedProject ? events.length : 0}</span>
-                </button>
+          </div>
+        </div>
+      ) : (
+        /* ─── Console body ─── */
+        <div className="console-body">
+          {/* ─── Sidebar ─── */}
+          <aside className="sidebar">
+            {/* Manager section */}
+            <div className="sb-section">
+              <div className="sb-header">
+                <span className="sb-label">Manager</span>
+                {managerSession ? (
+                  <StatusPill tone={statusToneFor(managerSession.status)} compact>
+                    {managerSession.status}
+                  </StatusPill>
+                ) : (
+                  <span className="sb-hint">not started</span>
+                )}
               </div>
+              {managerSession ? (
+                <div className="manager-row">
+                  <span className="mono">{shortId(managerSession.id)}</span>
+                  <button
+                    className="btn-ghost"
+                    disabled={pendingAction !== null}
+                    onClick={() => void handleStartManager()}
+                    type="button"
+                  >
+                    Restart
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="btn-accent"
+                  disabled={pendingAction !== null}
+                  onClick={() => void handleStartManager()}
+                  type="button"
+                  style={{ width: "100%" }}
+                >
+                  Start manager
+                </button>
+              )}
+            </div>
 
-              {mainView === "workspace" ? (
-                <div className="board-grid board-grid-workspace">
-                  <section className="panel">
-                    <div className="section-head">
-                      <div>
-                        <p className="section-kicker">Projects</p>
-                        <h2 className="section-title">Independent execution lanes</h2>
+            {/* Projects section */}
+            <div className="sb-section sb-section-grow">
+              <div className="sb-header">
+                <span className="sb-label">Projects</span>
+                <span className="sb-count">{projects.length}</span>
+              </div>
+              <div className="sb-scroll">
+                {(() => {
+                  // Group projects: parents (or standalone) first, then children underneath
+                  const parentProjects = projects.filter(
+                    (p) => !p.parent_project_id,
+                  );
+                  const childrenByParent: Record<string, Project[]> = {};
+                  for (const p of projects) {
+                    if (p.parent_project_id) {
+                      if (!childrenByParent[p.parent_project_id]) {
+                        childrenByParent[p.parent_project_id] = [];
+                      }
+                      childrenByParent[p.parent_project_id].push(p);
+                    }
+                  }
+
+                  const renderProjectItem = (
+                    project: Project,
+                    isChild: boolean,
+                  ) => {
+                    const worker = primaryWorkerSession(
+                      project,
+                      sessionsByProject[project.id] ?? [],
+                    );
+                    const selected = project.id === selectedProjectId;
+                    const children = childrenByParent[project.id];
+                    const isParent = children && children.length > 0;
+                    const isDecomposedParent = Boolean(
+                      (project.metadata as Record<string, unknown>)?.is_parent,
+                    );
+
+                    return (
+                      <div key={project.id}>
+                        <button
+                          className={`pj-item ${selected ? "is-active" : ""} ${isChild ? "pj-child" : ""}`}
+                          type="button"
+                          onClick={() =>
+                            setSelectedProjectId(project.id)
+                          }
+                        >
+                          <div className="pj-row">
+                            <span className="pj-name">
+                              {isDecomposedParent && isParent
+                                ? project.name
+                                : isChild
+                                  ? project.name
+                                  : project.name}
+                            </span>
+                            <span
+                              className="pj-dot"
+                              data-status={
+                                worker?.status ?? "idle"
+                              }
+                            />
+                          </div>
+                          <span className="pj-detail">
+                            {isParent
+                              ? `${children.length} sub-projects`
+                              : `${worker?.status ?? "idle"} \u00B7 ${compactPath(project.repo_path)}`}
+                          </span>
+                        </button>
+                        {isParent
+                          ? children.map((child) =>
+                              renderProjectItem(child, true),
+                            )
+                          : null}
                       </div>
+                    );
+                  };
+
+                  return parentProjects.map((project) =>
+                    renderProjectItem(project, false),
+                  );
+                })()}
+                {projects.length === 0 ? (
+                  <div className="sb-empty">
+                    No projects yet. Add one below.
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            {/* New project section */}
+            <div className="sb-section">
+              <button
+                className="sb-toggle"
+                type="button"
+                onClick={() => setShowNewProject(!showNewProject)}
+              >
+                {showNewProject ? "Cancel" : "+ New project"}
+              </button>
+              {showNewProject ? (
+                <form className="sb-form" onSubmit={handleCreateProject}>
+                  <div className="field">
+                    <span className="field-label">Name</span>
+                    <input
+                      className="field-input"
+                      value={projectForm.name}
+                      onChange={(e) =>
+                        setProjectForm((c) => ({ ...c, name: e.target.value }))
+                      }
+                      placeholder="Auth API hardening"
+                    />
+                  </div>
+                  <label className="field-check">
+                    <input
+                      checked={projectForm.createRepo}
+                      onChange={(e) =>
+                        setProjectForm((c) => ({
+                          ...c,
+                          createRepo: e.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                    <span>Auto-create repo</span>
+                  </label>
+                  {!projectForm.createRepo ? (
+                    <div className="field">
+                      <span className="field-label">Repo path</span>
+                      <input
+                        className="field-input"
+                        value={projectForm.repoPath}
+                        onChange={(e) =>
+                          setProjectForm((c) => ({
+                            ...c,
+                            repoPath: e.target.value,
+                          }))
+                        }
+                        placeholder="/path/to/repo"
+                      />
                     </div>
-                    <p className="section-copy panel-copy">
-                      Select one project, then start its worker session when you are ready.
-                    </p>
-                    <div className="project-grid">
-                      {projects.map((project) => {
-                        const worker = primaryWorkerSession(
-                          project,
-                          sessionsByProject[project.id] ?? [],
+                  ) : null}
+                  <div className="field">
+                    <span className="field-label">Objective (optional)</span>
+                    <textarea
+                      className="field-textarea"
+                      value={projectForm.objective}
+                      onChange={(e) =>
+                        setProjectForm((c) => ({
+                          ...c,
+                          objective: e.target.value,
+                        }))
+                      }
+                      rows={2}
+                      placeholder="What should the worker do?"
+                    />
+                  </div>
+                  <button
+                    className="btn-accent"
+                    disabled={pendingAction !== null}
+                    type="submit"
+                    style={{ width: "100%" }}
+                  >
+                    Add project
+                  </button>
+                </form>
+              ) : null}
+            </div>
+          </aside>
+
+          {/* ─── Main area ─── */}
+          <main className="main">
+            {/* Status strip */}
+            <div className="status-strip">
+              <div className="strip-left">
+                <h1 className="strip-title">{selectedPortfolio.name}</h1>
+                <p className="strip-goal">
+                  {selectedPortfolio.goal || "No portfolio goal set."}
+                </p>
+              </div>
+              <div className="strip-stats">
+                <div className="stat-box">
+                  <span className="stat-val">{portfolioProjectCount}</span>
+                  <span className="stat-label">Projects</span>
+                </div>
+                <div className="stat-box">
+                  <span
+                    className="stat-val"
+                    data-accent={activeWorkerCount > 0 ? "true" : undefined}
+                  >
+                    {activeWorkerCount}
+                  </span>
+                  <span className="stat-label">Active</span>
+                </div>
+                <div className="stat-box">
+                  <span
+                    className="stat-val"
+                    data-warn={openCheckpointCount > 0 ? "true" : undefined}
+                  >
+                    {openCheckpointCount}
+                  </span>
+                  <span className="stat-label">Inbox</span>
+                </div>
+              </div>
+              <div className="strip-actions">
+                {selectedProject && !selectedWorker ? (
+                  <button
+                    className="btn-outline"
+                    disabled={pendingAction !== null}
+                    onClick={() => void handleStartProject(selectedProject)}
+                    type="button"
+                  >
+                    Start project
+                  </button>
+                ) : null}
+                {openCheckpointCount > 0 ? (
+                  <button
+                    className="btn-outline"
+                    onClick={() => setMainView("inbox")}
+                    type="button"
+                  >
+                    View inbox
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            {/* Prompt bar */}
+            <div className="prompt-bar">
+              <span className="prompt-dot" />
+              <span className="prompt-text">
+                <strong>{nextActionTitle}</strong> &mdash; {nextActionDetail}
+              </span>
+            </div>
+
+            {/* Tab bar */}
+            <div className="tab-bar">
+              <button
+                className="tab"
+                data-active={mainView === "workspace"}
+                onClick={() => setMainView("workspace")}
+                type="button"
+              >
+                Workspace
+              </button>
+              <button
+                className="tab"
+                data-active={mainView === "inbox"}
+                onClick={() => setMainView("inbox")}
+                type="button"
+              >
+                Inbox
+                {openCheckpointCount > 0 ? (
+                  <span className="tab-badge" data-warn="true">
+                    {openCheckpointCount}
+                  </span>
+                ) : null}
+              </button>
+              <button
+                className="tab"
+                data-active={mainView === "deliverables"}
+                onClick={() => {
+                  setMainView("deliverables");
+                  setDeliverablePath("");
+                  setOpenFile(null);
+                }}
+                type="button"
+              >
+                Deliverables
+              </button>
+              <button
+                className="tab"
+                data-active={mainView === "activity"}
+                onClick={() => setMainView("activity")}
+                type="button"
+              >
+                Activity
+              </button>
+            </div>
+
+            {/* ─── View content ─── */}
+            <div className="view-content">
+              {/* === Workspace === */}
+              {mainView === "workspace" ? (
+                <div className="ws-layout">
+                  {/* Selected project detail */}
+                  {selectedProject ? (
+                    <div className="detail-panel">
+                      <div className="detail-header">
+                        <h2>{selectedProject.name}</h2>
+                        <StatusPill
+                          tone={statusToneFor(
+                            selectedWorker?.status ?? "idle",
+                          )}
+                        >
+                          {selectedWorker?.status ?? "idle"}
+                        </StatusPill>
+                      </div>
+
+                      <div className="detail-grid">
+                        <div className="detail-item">
+                          <span className="detail-key">Objective</span>
+                          <span className="detail-val">
+                            {selectedProject.objective || "No objective set"}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="detail-key">Repo</span>
+                          <span className="detail-val mono">
+                            {selectedProject.repo_path}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="detail-key">Worker</span>
+                          <span className="detail-val mono">
+                            {selectedWorker
+                              ? `${shortId(selectedWorker.id)} · ${selectedWorker.runtime.resolved_provider}`
+                              : "Not started"}
+                          </span>
+                        </div>
+                        <div className="detail-item">
+                          <span className="detail-key">Checkpoints</span>
+                          <span className="detail-val">
+                            {selectedProjectCheckpointCount || "None open"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Live progress feed */}
+                      {(() => {
+                        const progressEvents = events.filter(
+                          (e) =>
+                            (e.event_type === "session.progress" ||
+                              e.event_type === "session.start" ||
+                              e.event_type === "session.tests_run" ||
+                              e.event_type === "session.complete") &&
+                            e.payload?.summary,
                         );
-                        const openForProject = inbox.filter(
-                          (checkpoint) => checkpoint.project_id === project.id,
-                        ).length;
-                        const selected = project.id === selectedProjectId;
+                        const isRunning =
+                          selectedWorker?.status === "running" ||
+                          selectedWorker?.status === "starting";
+                        if (progressEvents.length === 0 && !isRunning)
+                          return null;
+
+                        // Gather file changes from progress events
+                        const allFiles: string[] = [];
+                        for (const e of progressEvents) {
+                          const files = e.payload?.files;
+                          if (Array.isArray(files)) {
+                            for (const f of files) {
+                              if (typeof f === "string" && !allFiles.includes(f))
+                                allFiles.push(f);
+                            }
+                          }
+                        }
+
+                        // Estimate progress based on elapsed time and event pattern
+                        const startedAt = selectedWorker?.started_at;
+                        const elapsedMs = startedAt
+                          ? Date.now() - new Date(startedAt).getTime()
+                          : 0;
+                        const elapsedMin = Math.floor(elapsedMs / 60_000);
+                        const hasTests = progressEvents.some(
+                          (e) => e.event_type === "session.tests_run",
+                        );
+                        const hasComplete = progressEvents.some(
+                          (e) => e.event_type === "session.complete",
+                        );
+
+                        // Use explicit progress % from worker if available
+                        const lastExplicitPct = [...progressEvents]
+                          .reverse()
+                          .find(
+                            (e) =>
+                              typeof e.payload?.progress === "number" &&
+                              e.payload.progress > 0,
+                          )?.payload?.progress as number | undefined;
+
+                        // Heuristic progress: files created = work done
+                        let estimatedPct: number;
+                        if (lastExplicitPct && lastExplicitPct > 0) {
+                          estimatedPct = Math.min(99, lastExplicitPct);
+                        } else {
+                          estimatedPct = Math.min(
+                            95,
+                            Math.round(
+                              (allFiles.length / 15) * 70 +
+                                (hasTests ? 15 : 0) +
+                                (hasComplete ? 100 : 0),
+                            ),
+                          );
+                        }
+                        if (isRunning && estimatedPct < 5 && elapsedMs > 10_000)
+                          estimatedPct = 5;
+                        if (hasComplete) estimatedPct = 100;
+
+                        // Get latest next_step for display
+                        const latestNextStep = [...progressEvents]
+                          .reverse()
+                          .find((e) => e.payload?.next_step)?.payload
+                          ?.next_step as string | undefined;
+
+                        // Time estimate: average project takes ~8-15 min
+                        // If we have progress, extrapolate
+                        let timeEstimate = "";
+                        if (isRunning && estimatedPct > 5 && estimatedPct < 95) {
+                          const totalEstMs =
+                            elapsedMs / (estimatedPct / 100);
+                          const remainMs = totalEstMs - elapsedMs;
+                          const remainMin = Math.ceil(remainMs / 60_000);
+                          if (remainMin > 0 && remainMin < 60) {
+                            timeEstimate = `~${remainMin}m remaining`;
+                          }
+                        } else if (isRunning && estimatedPct <= 5) {
+                          timeEstimate = "estimating...";
+                        }
 
                         return (
-                          <article
-                            key={project.id}
-                            className={`project-card ${selected ? "is-selected" : ""}`}
-                          >
-                            <button
-                              className="project-card-select"
-                              type="button"
-                              onClick={() => setSelectedProjectId(project.id)}
-                            >
-                              <div className="project-card-head">
-                                <div>
-                                  <h3>{project.name}</h3>
-                                  <p>{project.objective}</p>
-                                </div>
-                                <StatusPill tone={statusToneFor(worker?.status ?? project.status)}>
-                                  {worker?.status ?? "idle"}
-                                </StatusPill>
+                          <div className="progress-feed">
+                            <div className="progress-feed-header">
+                              <span className="progress-feed-label">
+                                {isRunning
+                                  ? "Live progress"
+                                  : hasComplete
+                                    ? "Completed"
+                                    : "Last session"}
+                              </span>
+                              {isRunning ? (
+                                <span className="progress-feed-dot" />
+                              ) : null}
+                              {timeEstimate ? (
+                                <span className="progress-feed-eta">
+                                  {timeEstimate}
+                                </span>
+                              ) : null}
+                            </div>
+
+                            {/* Progress bar */}
+                            {isRunning || hasComplete ? (
+                              <div className="progress-bar-track">
+                                <div
+                                  className="progress-bar-fill"
+                                  data-complete={hasComplete ? "true" : undefined}
+                                  style={{
+                                    width: `${estimatedPct}%`,
+                                  }}
+                                />
+                                <span className="progress-bar-label">
+                                  {estimatedPct}%
+                                  {allFiles.length > 0
+                                    ? ` · ${allFiles.length} files`
+                                    : ""}
+                                  {elapsedMin > 0
+                                    ? ` · ${elapsedMin}m elapsed`
+                                    : ""}
+                                </span>
                               </div>
-                              <div className="project-meta">
-                                <span>repo {compactPath(project.repo_path)}</span>
-                                <span>branch {project.default_branch}</span>
-                                <span>{openForProject} open checkpoint(s)</span>
+                            ) : null}
+
+                            {/* Next step indicator */}
+                            {latestNextStep && isRunning ? (
+                              <div className="progress-next-step">
+                                Next: {latestNextStep}
                               </div>
-                              <div className="project-meta">
-                                <span>{worker ? `worker ${shortId(worker.id)}` : "worker not started"}</span>
-                                <span>{worker?.runtime.resolved_provider ?? "runtime not selected"}</span>
-                                <span>{worker?.branch_name ? `workspace ${worker.branch_name}` : "no branch yet"}</span>
+                            ) : null}
+
+                            {/* Files being created */}
+                            {allFiles.length > 0 ? (
+                              <div className="progress-files">
+                                {allFiles.slice(-8).map((f) => (
+                                  <span key={f} className="progress-file-tag">
+                                    {f.split("/").pop()}
+                                  </span>
+                                ))}
+                                {allFiles.length > 8 ? (
+                                  <span className="progress-file-tag progress-file-more">
+                                    +{allFiles.length - 8} more
+                                  </span>
+                                ) : null}
                               </div>
-                              {project.completion_summary ? (
-                                <div className="completion-note">
-                                  {project.completion_summary}
+                            ) : null}
+
+                            <div className="progress-feed-list">
+                              {progressEvents
+                                .slice(-8)
+                                .reverse()
+                                .map((e) => (
+                                  <div
+                                    key={e.id}
+                                    className="progress-feed-item"
+                                  >
+                                    <span
+                                      className="progress-feed-icon"
+                                      data-type={e.event_type.replace(
+                                        "session.",
+                                        "",
+                                      )}
+                                    >
+                                      {e.event_type === "session.tests_run"
+                                        ? e.payload?.status === "passed"
+                                          ? "\u2713"
+                                          : "\u2717"
+                                        : e.event_type === "session.complete"
+                                          ? "\u2605"
+                                          : e.event_type === "session.start"
+                                            ? "\u25B6"
+                                            : "\u2022"}
+                                    </span>
+                                    <span className="progress-feed-time">
+                                      {friendlyTime(e.occurred_at)}
+                                    </span>
+                                    <span className="progress-feed-msg">
+                                      {String(e.payload?.summary ?? "")}
+                                    </span>
+                                  </div>
+                                ))}
+                              {progressEvents.length === 0 && isRunning ? (
+                                <div className="progress-feed-item">
+                                  <span className="progress-feed-msg">
+                                    Worker is starting up...
+                                  </span>
                                 </div>
                               ) : null}
-                            </button>
-                            <div className="project-actions">
-                              <button
-                                className="button-secondary"
-                                disabled={pendingAction !== null}
-                                onClick={() => void handleStartProject(project)}
-                                type="button"
-                              >
-                                {worker ? "Restart project" : "Start project"}
-                              </button>
                             </div>
-                          </article>
+                          </div>
                         );
-                      })}
+                      })()}
 
-                      {projects.length === 0 ? (
-                        <div className="empty-block">
-                          Add the first project in this portfolio to create its dedicated repo and worker lane.
+                      {selectedProject.completion_summary ? (
+                        <div className="completion-note">
+                          {selectedProject.completion_summary}
                         </div>
                       ) : null}
-                    </div>
-                  </section>
 
-                  <div className="workspace-stack">
-                    <section className="panel">
-                      <div className="section-head">
-                        <div>
-                          <p className="section-kicker">Selected project</p>
-                          <h2 className="section-title">
-                            {selectedProject ? selectedProject.name : "Pick a project"}
-                          </h2>
-                        </div>
-                        {selectedWorker ? (
-                          <StatusPill tone={statusToneFor(selectedWorker.status)}>
-                            {selectedWorker.status}
-                          </StatusPill>
-                        ) : null}
+                      {/* Continue / instruct box */}
+                      <div className="instruction-box">
+                        <textarea
+                          className="instruction-input"
+                          value={instructionDraft}
+                          onChange={(e) =>
+                            setInstructionDraft(e.target.value)
+                          }
+                          placeholder={
+                            selectedProject.completion_summary
+                              ? "Continue project — describe the next task..."
+                              : "Send instruction to worker..."
+                          }
+                          rows={2}
+                        />
+                        {selectedProject.completion_summary ? (
+                          <button
+                            className="btn-accent"
+                            disabled={
+                              pendingAction !== null ||
+                              !instructionDraft.trim()
+                            }
+                            onClick={() => {
+                              const msg = instructionDraft.trim();
+                              if (!msg) return;
+                              void (async () => {
+                                await runAction(
+                                  "Continued project",
+                                  async () => {
+                                    await startProjectExecution({
+                                      projectId: selectedProject.id,
+                                      runtimePreference: "auto",
+                                      allowSimulationFallback: true,
+                                      initialMessage: msg,
+                                    });
+                                    setInstructionDraft("");
+                                    await refreshAfterAction(
+                                      selectedProject.portfolio_id,
+                                      selectedProject.id,
+                                    );
+                                  },
+                                );
+                              })();
+                            }}
+                            type="button"
+                          >
+                            Continue project
+                          </button>
+                        ) : (
+                          <button
+                            className="btn-sm"
+                            disabled={pendingAction !== null}
+                            onClick={() => void handleSendInstruction()}
+                            type="button"
+                          >
+                            Send
+                          </button>
+                        )}
                       </div>
 
-                      {selectedProject ? (
-                        <div className="project-focus">
-                          <div className="focus-grid">
-                            <div className="focus-card">
-                              <p className="focus-label">Objective</p>
-                              <p>{selectedProject.objective}</p>
-                            </div>
-                            <div className="focus-card">
-                              <p className="focus-label">Open checkpoints</p>
-                              <p>{selectedProjectCheckpointCount || "No open manager inbox items"}</p>
-                            </div>
-                            <div className="focus-card">
-                              <p className="focus-label">Worker</p>
-                              <p>
-                                {selectedWorker
-                                  ? `${shortId(selectedWorker.id)} · ${selectedWorker.runtime.resolved_provider}`
-                                  : "No worker session started"}
-                              </p>
-                            </div>
-                            <div className="focus-card">
-                              <p className="focus-label">Repo</p>
-                              <p>{selectedProject.repo_path}</p>
-                            </div>
-                          </div>
-
-                          <label className="field">
-                            <span>Manager instruction</span>
-                            <textarea
-                              className="field-textarea"
-                              rows={4}
-                              value={instructionDraft}
-                              onChange={(event) => setInstructionDraft(event.target.value)}
-                              placeholder="Tell the selected worker what to do next or how to correct course."
-                            />
-                          </label>
-                          <div className="action-row">
-                            <button
-                              className="button-primary"
-                              disabled={pendingAction !== null}
-                              onClick={() => void handleSendInstruction()}
-                              type="button"
-                            >
-                              Send instruction
-                            </button>
-                            <button
-                              className="button-secondary"
-                              disabled={pendingAction !== null}
-                              onClick={() => void handleStartProject(selectedProject)}
-                              type="button"
-                            >
-                              {selectedWorker ? "Restart project session" : "Start project session"}
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="empty-block">
-                          Pick a project card on the left to see its details and send instructions.
-                        </div>
-                      )}
-                    </section>
-
-                    <section className="panel">
-                      <div className="section-head">
-                        <div>
-                          <p className="section-kicker">Create</p>
-                          <h2 className="section-title">Add project</h2>
-                        </div>
-                      </div>
-                      <p className="section-copy panel-copy">
-                        Use a name only for a new repo, or turn auto-create off to point at an existing repo.
-                      </p>
-                      <form className="stack-form" onSubmit={handleCreateProject}>
-                        <label className="field">
-                          <span>Name</span>
-                          <input
-                            className="field-input"
-                            value={projectForm.name}
-                            onChange={(event) =>
-                              setProjectForm((current) => ({
-                                ...current,
-                                name: event.target.value,
-                              }))
-                            }
-                            placeholder="Auth API hardening"
-                          />
-                        </label>
-                        <div className="field">
-                          <span>Repository</span>
-                          <label className="field-inline">
-                            <input
-                              checked={projectForm.createRepo}
-                              onChange={(event) =>
-                                setProjectForm((current) => ({
-                                  ...current,
-                                  createRepo: event.target.checked,
-                                }))
-                              }
-                              type="checkbox"
-                            />
-                            <span>Create a new local repo automatically</span>
-                          </label>
-                        </div>
-                        <label className="field">
-                          <span>Repo path</span>
-                          <input
-                            className="field-input"
-                            disabled={projectForm.createRepo}
-                            value={projectForm.repoPath}
-                            onChange={(event) =>
-                              setProjectForm((current) => ({
-                                ...current,
-                                repoPath: event.target.value,
-                              }))
-                            }
-                            placeholder={
-                              projectForm.createRepo
-                                ? "Created automatically from the project name"
-                                : "/Users/nico-yardlogix/some-repo"
-                            }
-                          />
-                        </label>
-                        <label className="field-inline">
-                          <span>Default branch</span>
-                          <input
-                            className="field-input"
-                            value={projectForm.defaultBranch}
-                            onChange={(event) =>
-                              setProjectForm((current) => ({
-                                ...current,
-                                defaultBranch: event.target.value,
-                              }))
-                            }
-                            placeholder="main"
-                          />
-                        </label>
-                        <label className="field">
-                          <span>Objective (optional)</span>
-                          <textarea
-                            className="field-textarea"
-                            value={projectForm.objective}
-                            onChange={(event) =>
-                              setProjectForm((current) => ({
-                                ...current,
-                                objective: event.target.value,
-                              }))
-                            }
-                            rows={4}
-                            placeholder="Leave blank to use the default project brief."
-                          />
-                        </label>
+                      <div className="detail-actions">
                         <button
-                          className="button-primary"
+                          className="btn-accent"
                           disabled={pendingAction !== null}
-                          type="submit"
+                          onClick={() =>
+                            void handleStartProject(selectedProject)
+                          }
+                          type="button"
                         >
-                          Add project
+                          {selectedWorker ? "Restart" : "Start"} project
                         </button>
-                      </form>
-                    </section>
+                        <button
+                          className="btn-ghost"
+                          onClick={() => setMainView("activity")}
+                          type="button"
+                        >
+                          View activity
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="empty-panel">
+                      Select a project from the sidebar to view details and
+                      send instructions.
+                    </div>
+                  )}
+
+                  {/* Project overview cards (right side) */}
+                  <div className="project-overview">
+                    <div className="overview-header">
+                      <span className="overview-label">
+                        All projects ({projects.length})
+                      </span>
+                    </div>
+                    {projects.map((project) => {
+                      const worker = primaryWorkerSession(
+                        project,
+                        sessionsByProject[project.id] ?? [],
+                      );
+                      const openForProject = inbox.filter(
+                        (c) => c.project_id === project.id,
+                      ).length;
+                      const selected = project.id === selectedProjectId;
+
+                      return (
+                        <div
+                          key={project.id}
+                          className={`pj-card ${selected ? "is-active" : ""}`}
+                          onClick={() => setSelectedProjectId(project.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter")
+                              setSelectedProjectId(project.id);
+                          }}
+                          tabIndex={0}
+                          role="button"
+                        >
+                          <div className="pj-card-head">
+                            <span className="pj-card-title">
+                              {project.name}
+                            </span>
+                            <StatusPill
+                              tone={statusToneFor(
+                                worker?.status ?? project.status,
+                              )}
+                              compact
+                            >
+                              {worker?.status ?? "idle"}
+                            </StatusPill>
+                          </div>
+                          {project.objective ? (
+                            <p className="pj-card-obj">
+                              {project.objective}
+                            </p>
+                          ) : null}
+                          <div className="pj-card-meta">
+                            <span className="meta-chip">
+                              {compactPath(project.repo_path)}
+                            </span>
+                            <span className="meta-chip">
+                              {project.default_branch}
+                            </span>
+                            {openForProject > 0 ? (
+                              <span className="meta-chip">
+                                {openForProject} checkpoint(s)
+                              </span>
+                            ) : null}
+                            {worker ? (
+                              <span className="meta-chip">
+                                {worker.runtime.resolved_provider}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div
+                            className="detail-actions"
+                            style={{ marginTop: "4px" }}
+                          >
+                            <button
+                              className="btn-sm"
+                              disabled={pendingAction !== null}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleStartProject(project);
+                              }}
+                              type="button"
+                            >
+                              {worker ? "Restart" : "Start"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {projects.length === 0 ? (
+                      <div className="sb-empty">
+                        Add a project via the sidebar to create its worker
+                        lane.
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               ) : null}
 
+              {/* === Inbox === */}
               {mainView === "inbox" ? (
-                <section className="panel panel-wide">
-                  <div className="section-head">
-                    <div>
-                      <p className="section-kicker">Inbox</p>
-                      <h2 className="section-title">Manager inbox</h2>
-                    </div>
-                    <StatusPill tone={statusToneFor(openCheckpointCount > 0 ? "warning" : "success")}>
-                      {openCheckpointCount} open
-                    </StatusPill>
+                <div>
+                  <div className="inbox-header">
+                    <span className="inbox-title">
+                      Manager inbox &middot; {openCheckpointCount} open
+                    </span>
                   </div>
-                  <p className="section-copy panel-copy">
-                    Open items appear here whenever a worker asks for help, gets blocked, or claims completion.
-                  </p>
-                  <div className="checkpoint-list">
+                  <div className="inbox-list">
                     {inbox.map((checkpoint) => {
                       const details = asRecord(checkpoint.details);
                       const reviewContext = asRecord(details.review_context);
@@ -1099,44 +1548,69 @@ export function DashboardShell() {
                       const draft = checkpointDrafts[checkpoint.id] ?? "";
 
                       return (
-                        <article className="checkpoint-card" key={checkpoint.id}>
-                          <div className="checkpoint-head">
+                        <article
+                          className="ckpt-card"
+                          data-kind={checkpoint.kind}
+                          key={checkpoint.id}
+                        >
+                          <div className="ckpt-header">
                             <div>
-                              <p className="checkpoint-project">{checkpoint.project_name}</p>
+                              <p className="ckpt-project">
+                                {checkpoint.project_name}
+                              </p>
                               <h3>{checkpoint.summary}</h3>
                             </div>
-                            <div className="checkpoint-meta">
-                              <StatusPill tone={statusToneFor(checkpoint.kind)}>
+                            <div className="ckpt-meta">
+                              <StatusPill
+                                tone={statusToneFor(checkpoint.kind)}
+                                compact
+                              >
                                 {checkpoint.kind}
                               </StatusPill>
-                              <span>{friendlyTime(checkpoint.source_occurred_at)}</span>
+                              <span className="ckpt-time">
+                                {friendlyTime(checkpoint.source_occurred_at)}
+                              </span>
                             </div>
                           </div>
 
                           {asString(reviewContext.error) ? (
-                            <p className="checkpoint-warning">{asString(reviewContext.error)}</p>
+                            <p className="ckpt-warning">
+                              {asString(reviewContext.error)}
+                            </p>
                           ) : null}
 
                           {checkpoint.kind === "completion" ? (
-                            <div className="review-context">
-                              <div className="review-stats">
-                                <span>{asString(diffDetails.summary) ?? "No diff summary"}</span>
-                                <span>
-                                  {asArray(diffDetails.changed_files).length} changed file(s)
+                            <div className="review-ctx">
+                              <div className="review-stat-row">
+                                <span className="review-stat">
+                                  {asString(diffDetails.summary) ??
+                                    "No diff summary"}
                                 </span>
-                                <span>{checks.length} verification artifact(s)</span>
+                                <span className="review-stat">
+                                  {asArray(diffDetails.changed_files).length}{" "}
+                                  file(s)
+                                </span>
+                                <span className="review-stat">
+                                  {checks.length} check(s)
+                                </span>
                               </div>
-                              {asArray(diffDetails.changed_files).length > 0 ? (
-                                <div className="tag-list">
-                                  {asArray(diffDetails.changed_files).map((item) => (
-                                    <span className="file-tag" key={String(item)}>
-                                      {String(item)}
-                                    </span>
-                                  ))}
+                              {asArray(diffDetails.changed_files).length >
+                              0 ? (
+                                <div className="file-chips">
+                                  {asArray(diffDetails.changed_files).map(
+                                    (item) => (
+                                      <span
+                                        className="file-chip"
+                                        key={String(item)}
+                                      >
+                                        {String(item)}
+                                      </span>
+                                    ),
+                                  )}
                                 </div>
                               ) : null}
                               {asString(diffDetails.diff_preview) ? (
-                                <pre className="diff-preview">
+                                <pre className="diff-block">
                                   {String(diffDetails.diff_preview)}
                                 </pre>
                               ) : null}
@@ -1145,12 +1619,28 @@ export function DashboardShell() {
                                   {checks.map((check, index) => {
                                     const checkRecord = asRecord(check);
                                     return (
-                                      <div className="check-row" key={`${checkpoint.id}-${index}`}>
-                                        <StatusPill tone={statusToneFor(asString(checkRecord.status) ?? "info")} compact>
-                                          {asString(checkRecord.kind) ?? "check"}
+                                      <div
+                                        className="check-item"
+                                        key={`${checkpoint.id}-${index}`}
+                                      >
+                                        <StatusPill
+                                          tone={statusToneFor(
+                                            asString(checkRecord.status) ??
+                                              "info",
+                                          )}
+                                          compact
+                                        >
+                                          {asString(checkRecord.kind) ??
+                                            "check"}
                                         </StatusPill>
-                                        <span>{asString(checkRecord.command) ?? "unknown command"}</span>
-                                        <span>{asString(checkRecord.status) ?? "unknown"}</span>
+                                        <span className="mono">
+                                          {asString(checkRecord.command) ??
+                                            "—"}
+                                        </span>
+                                        <span>
+                                          {asString(checkRecord.status) ??
+                                            "unknown"}
+                                        </span>
                                       </div>
                                     );
                                   })}
@@ -1159,41 +1649,43 @@ export function DashboardShell() {
                             </div>
                           ) : null}
 
-                          <label className="field">
-                            <span>Manager response</span>
+                          <div className="ckpt-response">
                             <textarea
-                              className="field-textarea"
-                              rows={3}
+                              className="ckpt-textarea"
+                              rows={2}
                               value={draft}
-                              onChange={(event) =>
-                                setCheckpointDrafts((current) => ({
-                                  ...current,
-                                  [checkpoint.id]: event.target.value,
+                              onChange={(e) =>
+                                setCheckpointDrafts((c) => ({
+                                  ...c,
+                                  [checkpoint.id]: e.target.value,
                                 }))
                               }
                               placeholder={
                                 checkpoint.kind === "completion"
                                   ? "Request changes or leave blank to approve."
-                                  : "Answer the project session so it can continue."
+                                  : "Answer the project so it can continue."
                               }
                             />
-                          </label>
+                          </div>
 
-                          <div className="checkpoint-actions">
+                          <div className="ckpt-actions">
                             {checkpoint.kind === "completion" ? (
                               <>
                                 <button
-                                  className="button-primary"
+                                  className="btn-accent"
                                   disabled={pendingAction !== null}
                                   onClick={() =>
-                                    void handleCheckpointAction(checkpoint, "approve")
+                                    void handleCheckpointAction(
+                                      checkpoint,
+                                      "approve",
+                                    )
                                   }
                                   type="button"
                                 >
                                   Approve
                                 </button>
                                 <button
-                                  className="button-secondary"
+                                  className="btn-outline"
                                   disabled={pendingAction !== null}
                                   onClick={() =>
                                     void handleCheckpointAction(
@@ -1208,10 +1700,13 @@ export function DashboardShell() {
                               </>
                             ) : (
                               <button
-                                className="button-primary"
+                                className="btn-accent"
                                 disabled={pendingAction !== null}
                                 onClick={() =>
-                                  void handleCheckpointAction(checkpoint, "answer")
+                                  void handleCheckpointAction(
+                                    checkpoint,
+                                    "answer",
+                                  )
                                 }
                                 type="button"
                               >
@@ -1219,10 +1714,13 @@ export function DashboardShell() {
                               </button>
                             )}
                             <button
-                              className="button-ghost"
+                              className="btn-ghost"
                               disabled={pendingAction !== null}
                               onClick={() =>
-                                void handleCheckpointAction(checkpoint, "dismiss")
+                                void handleCheckpointAction(
+                                  checkpoint,
+                                  "dismiss",
+                                )
                               }
                               type="button"
                             >
@@ -1234,68 +1732,231 @@ export function DashboardShell() {
                     })}
 
                     {inbox.length === 0 ? (
-                      <div className="empty-block">
-                        No open manager inbox items. Start or continue projects and new
-                        questions, blockers, or completion claims will appear here.
+                      <div className="empty-panel">
+                        No open inbox items. Start or continue projects and
+                        checkpoints will appear here.
                       </div>
                     ) : null}
                   </div>
-                </section>
+                </div>
               ) : null}
 
-              {mainView === "activity" ? (
-                <section className="panel panel-wide">
-                  <div className="section-head">
-                    <div>
-                      <p className="section-kicker">Activity</p>
-                      <h2 className="section-title">
-                        {selectedProject ? `${selectedProject.name} event feed` : "Project feed"}
-                      </h2>
+              {/* === Deliverables === */}
+              {mainView === "deliverables" ? (
+                <div className="deliverables-view">
+                  {!selectedProject ? (
+                    <div className="empty-panel">
+                      Select a project to view its deliverables.
                     </div>
+                  ) : showPreview && previewInfo?.preview_url ? (
+                    <div className="preview-panel">
+                      <div className="preview-header">
+                        <button
+                          className="btn-ghost"
+                          onClick={() => setShowPreview(false)}
+                          type="button"
+                        >
+                          &larr; Files
+                        </button>
+                        <span className="preview-label">
+                          Live preview &mdash;{" "}
+                          <span className="mono">
+                            {previewInfo.entry_file}
+                          </span>
+                        </span>
+                        <a
+                          className="btn-ghost"
+                          href={`http://localhost:8001${previewInfo.preview_url}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Open in new tab
+                        </a>
+                      </div>
+                      <iframe
+                        className="preview-iframe"
+                        src={`http://localhost:8001${previewInfo.preview_url}`}
+                        title="Project preview"
+                        sandbox="allow-scripts allow-same-origin"
+                      />
+                    </div>
+                  ) : openFile ? (
+                    <div className="file-viewer">
+                      <div className="file-viewer-header">
+                        <button
+                          className="btn-ghost"
+                          onClick={() => setOpenFile(null)}
+                          type="button"
+                        >
+                          &larr; Back
+                        </button>
+                        <span className="file-viewer-path mono">
+                          {openFile.path}
+                        </span>
+                        <span className="file-viewer-meta">
+                          {(openFile.size / 1024).toFixed(1)} KB
+                        </span>
+                      </div>
+                      <pre className="file-viewer-content">
+                        {openFile.content}
+                      </pre>
+                    </div>
+                  ) : (
+                    <div className="file-browser">
+                      {/* Action bar */}
+                      <div className="deliverables-actions">
+                        {previewInfo?.available ? (
+                          <button
+                            className="btn-accent"
+                            onClick={() => setShowPreview(true)}
+                            type="button"
+                          >
+                            Preview{" "}
+                            {previewInfo.kind === "html"
+                              ? "app"
+                              : "document"}
+                          </button>
+                        ) : null}
+                        <button
+                          className="btn-outline"
+                          disabled={pushingGh}
+                          onClick={() => void handlePushGitHub()}
+                          type="button"
+                        >
+                          {pushingGh
+                            ? "Pushing..."
+                            : "Push to GitHub"}
+                        </button>
+                        {ghPushResult ? (
+                          <span
+                            className={`gh-result ${ghPushResult.success ? "gh-ok" : "gh-err"}`}
+                          >
+                            {ghPushResult.success ? (
+                              <a
+                                href={ghPushResult.repo_url ?? "#"}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                {ghPushResult.repo_url}
+                              </a>
+                            ) : (
+                              ghPushResult.error
+                            )}
+                          </span>
+                        ) : null}
+                      </div>
+
+                      {/* File listing */}
+                      <div className="file-browser-header">
+                        <span className="file-browser-path mono">
+                          /{deliverablePath || selectedProject.name}
+                        </span>
+                        {deliverablePath ? (
+                          <button
+                            className="btn-ghost"
+                            onClick={handleNavigateUp}
+                            type="button"
+                          >
+                            &larr; Up
+                          </button>
+                        ) : null}
+                      </div>
+                      {deliverableFiles.length === 0 ? (
+                        <div className="empty-panel">
+                          No deliverable files found. The worker may not
+                          have produced output yet.
+                        </div>
+                      ) : (
+                        <div className="file-list">
+                          {deliverableFiles.map((entry) => (
+                            <button
+                              key={entry.path}
+                              className="file-entry"
+                              type="button"
+                              onClick={() =>
+                                entry.is_dir
+                                  ? handleNavigateDir(entry.path)
+                                  : void handleOpenFile(entry.path)
+                              }
+                            >
+                              <span className="file-icon">
+                                {entry.is_dir ? "\u{1F4C1}" : "\u{1F4C4}"}
+                              </span>
+                              <span className="file-name">
+                                {entry.name}
+                              </span>
+                              {entry.size !== null ? (
+                                <span className="file-size mono">
+                                  {entry.size < 1024
+                                    ? `${entry.size} B`
+                                    : `${(entry.size / 1024).toFixed(1)} KB`}
+                                </span>
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+
+              {/* === Activity === */}
+              {mainView === "activity" ? (
+                <div>
+                  <div className="activity-header">
+                    <span className="activity-title">
+                      {selectedProject
+                        ? `${selectedProject.name} — ${events.length} events`
+                        : "Select a project"}
+                    </span>
                   </div>
-                  <p className="section-copy panel-copy">
-                    This is the latest event stream for the currently selected project.
-                  </p>
                   <div className="activity-list">
                     {events.map((event) => (
-                      <div className="activity-row" key={event.id}>
-                        <div className="activity-marker" data-tone={statusToneFor(event.level)} />
-                        <div className="activity-copy">
-                          <div className="activity-head">
-                            <strong>{eventTitle(event)}</strong>
-                            <span>{friendlyTime(event.occurred_at)}</span>
+                      <div className="evt-row" key={event.id}>
+                        <span
+                          className="evt-dot"
+                          data-tone={statusToneFor(event.level)}
+                        />
+                        <div className="evt-content">
+                          <div className="evt-head">
+                            <span className="evt-title">
+                              {eventTitle(event)}
+                            </span>
+                            <span className="evt-time">
+                              {friendlyTime(event.occurred_at)}
+                            </span>
                           </div>
-                          <p>{eventDetail(event)}</p>
-                          <div className="activity-meta">
-                            <span>{event.event_type}</span>
-                            {event.session_id ? <span>session {shortId(event.session_id)}</span> : null}
+                          {eventDetail(event) ? (
+                            <span className="evt-detail">
+                              {eventDetail(event)}
+                            </span>
+                          ) : null}
+                          <div className="evt-meta">
+                            <span className="evt-tag">
+                              {event.event_type}
+                            </span>
+                            {event.session_id ? (
+                              <span className="evt-tag">
+                                session {shortId(event.session_id)}
+                              </span>
+                            ) : null}
                           </div>
                         </div>
                       </div>
                     ))}
                     {events.length === 0 ? (
-                      <div className="empty-block">
-                        Select a project to stream activity here.
+                      <div className="empty-panel">
+                        Select a project to stream its activity.
                       </div>
                     ) : null}
                   </div>
-                </section>
+                </div>
               ) : null}
-            </>
-          ) : (
-            <section className="hero-card is-empty">
-              <div className="hero-copy">
-                <p className="section-kicker">Portfolio view</p>
-                <h1>No portfolio selected</h1>
-                <p>
-                  Create a portfolio in the left sidebar, then add independent projects
-                  and start a manager session to supervise them.
-                </p>
-              </div>
-            </section>
-          )}
-        </section>
-      </main>
+            </div>
+          </main>
+        </div>
+      )}
     </div>
   );
 }

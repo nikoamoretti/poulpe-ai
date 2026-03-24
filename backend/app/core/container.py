@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.core.database import DatabaseManager, build_database_manager
 from app.core.event_stream import EventStreamBroker
 from app.services.command_runner import CommandRunner
+from app.services.business_orchestration_service import BusinessOrchestrationService
 from app.services.orchestration_service import OrchestratorService
 from app.services.portfolio_automation_service import PortfolioAutomationService
 from app.services.runtime_service import RuntimeService
@@ -36,6 +37,7 @@ class ServiceContainer:
     worktree_manager: WorktreeManager
     orchestrator: OrchestratorService
     portfolio_automation: PortfolioAutomationService
+    business_orchestration: BusinessOrchestrationService
 
     def ensure_local_dirs(self) -> None:
         self.settings.ensure_local_dirs()
@@ -123,6 +125,16 @@ def build_container(settings: Settings) -> ServiceContainer:
         worktree_manager=worktree_manager,
     )
 
+    business_orchestration = BusinessOrchestrationService(
+        settings=settings,
+        database=database,
+        redis_bus=redis_bus,
+        event_broker=event_broker,
+        session_supervisor=session_supervisor,
+        task_packet_service=task_packet_service,
+        runtime_service=runtime_service,
+    )
+
     return ServiceContainer(
         settings=settings,
         database=database,
@@ -138,4 +150,5 @@ def build_container(settings: Settings) -> ServiceContainer:
         worktree_manager=worktree_manager,
         orchestrator=orchestrator,
         portfolio_automation=portfolio_automation,
+        business_orchestration=business_orchestration,
     )

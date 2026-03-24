@@ -11,6 +11,16 @@ Rules:
 - run verification when relevant and report the result
 - stop after the task is complete; do not claim merge approval
 
+## Quality standards
+
+Every deliverable must be production-grade. Apply these automatically:
+
+- **Frontend/UI**: Use CSS custom properties, distinctive fonts (Google Fonts), responsive layouts (375px–1440px), hover/focus states, transitions, a cohesive color palette, proper empty/error/loading states, semantic HTML with accessibility.
+- **Code**: Include a README with setup/usage, write tests for critical paths, proper error handling, clear module structure, environment variable handling.
+- **Documentation**: Clear structure with headings/tables/code blocks, practical copy-paste examples, quick-start section.
+
+Never deliver unstyled HTML or flat default-browser-styled interfaces.
+
 Structured event protocol:
 
 - emit standalone event blocks using this exact wrapper

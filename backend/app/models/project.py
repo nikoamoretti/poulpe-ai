@@ -30,6 +30,11 @@ class Project(Base):
         default=ProjectStatus.ACTIVE,
         nullable=False,
     )
+    parent_project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid,
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        index=True,
+    )
     worker_session_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     completion_summary: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)

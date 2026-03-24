@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func as sa_func, select
 from sqlalchemy.orm import Session
 
 from app.adapters.redis_bus import RedisBusAdapter
@@ -20,6 +20,7 @@ from app.core.enums import (
     ProjectCheckpointAction,
     ProjectCheckpointKind,
     ProjectCheckpointStatus,
+    ProjectStatus,
     SessionRole,
     SessionStatus,
     StructuredEventType,
@@ -27,6 +28,7 @@ from app.core.enums import (
 from app.core.errors import NotFoundError
 from app.core.event_stream import EventStreamBroker
 from app.models.portfolio import Portfolio
+from app.models.project import Project
 from app.models.project_checkpoint import ProjectCheckpoint
 from app.models.session import Session as SessionModel
 from app.models.parsed_session_event import ParsedSessionEvent
@@ -36,6 +38,7 @@ from app.schemas.portfolio import (
     PortfolioAutomationTickRead,
     PortfolioManagerStartRequest,
 )
+from app.schemas.project import ProjectCreate, ProjectStartRequest
 from app.schemas.project_checkpoint import ProjectCheckpointRespondRequest
 from app.services.command_runner import CommandRunner
 from app.services.event_service import EventService
@@ -137,6 +140,16 @@ class PortfolioAutomationService:
                 manager_session = self._current_manager_session(db, portfolio)
 
             if not open_checkpoints:
+                # Check if portfolio needs planning (goal decomposition)
+                planning_action = self._maybe_plan_portfolio(
+                    db=db,
+                    services=services,
+                    portfolio=portfolio,
+                    manager_session=manager_session,
+                )
+                if planning_action is not None:
+                    actions.append(planning_action)
+
                 completed_at = datetime.now(UTC)
                 return PortfolioAutomationTickRead(
                     portfolio_id=portfolio.id,
@@ -639,6 +652,488 @@ class PortfolioAutomationService:
             checkpoint_id=checkpoint.id,
             session_id=turn_session.id,
             detail=f"Started a portfolio manager turn for checkpoint {checkpoint.id}.",
+        )
+
+    # ── Portfolio planning (goal decomposition) ──
+
+    def _maybe_plan_portfolio(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+        manager_session: SessionModel | None,
+    ) -> PortfolioAutomationActionRead | None:
+        """If the portfolio has a goal but no projects, launch a planning turn."""
+        if not self._needs_planning(db, portfolio):
+            return None
+        if manager_session is None:
+            return None
+
+        # Check if a planning turn is already running
+        active = self._active_planning_turn(db, portfolio.id)
+        if active is not None:
+            return self._action(
+                kind="planning_turn_active",
+                portfolio_id=portfolio.id,
+                session_id=active.id,
+                detail="A portfolio planning turn is already running.",
+            )
+
+        # Check if a completed planning turn needs to be resolved
+        resolve_action = self._process_completed_planning_turns(
+            db=db,
+            services=services,
+            portfolio=portfolio,
+        )
+        if resolve_action is not None:
+            return resolve_action
+
+        # If still needs planning after resolving, launch a new turn
+        if not self._needs_planning(db, portfolio):
+            return None
+
+        return self._launch_planning_turn(
+            db=db,
+            services=services,
+            portfolio=portfolio,
+            manager_session=manager_session,
+        )
+
+    def _needs_planning(self, db: Session, portfolio: Portfolio) -> bool:
+        """Portfolio needs planning if it has a goal but no projects.
+
+        Returns False if a planning turn has already been attempted (even if it failed),
+        to prevent infinite retry loops.
+        """
+        if not portfolio.goal or not portfolio.goal.strip():
+            return False
+        project_count = db.scalar(
+            select(sa_func.count(Project.id)).where(
+                Project.portfolio_id == portfolio.id,
+                Project.status == ProjectStatus.ACTIVE,
+            )
+        )
+        if project_count > 0:
+            return False
+        # If any planning turns have already been attempted, don't retry
+        existing_planning_turns = self._planning_turn_sessions(db, portfolio.id)
+        if existing_planning_turns:
+            return False
+        return True
+
+    def _planning_turn_sessions(self, db: Session, portfolio_id: UUID) -> list[SessionModel]:
+        sessions = db.scalars(
+            select(SessionModel)
+            .where(
+                SessionModel.portfolio_id == portfolio_id,
+                SessionModel.role == SessionRole.MANAGER,
+                SessionModel.supervisor_session_id.is_not(None),
+            )
+            .order_by(SessionModel.created_at.asc())
+        ).all()
+        return [
+            session
+            for session in sessions
+            if str(session.metadata_json.get("session_kind") or "") == "portfolio_planning_turn"
+        ]
+
+    def _active_planning_turn(self, db: Session, portfolio_id: UUID) -> SessionModel | None:
+        for session in reversed(self._planning_turn_sessions(db, portfolio_id)):
+            if self._turn_processed(session):
+                continue
+            if session.status in ACTIVE_SESSION_STATUSES:
+                return session
+        return None
+
+    def _launch_planning_turn(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+        manager_session: SessionModel,
+    ) -> PortfolioAutomationActionRead:
+        Path(self._manager_workspace_path(portfolio)).mkdir(parents=True, exist_ok=True)
+
+        preferred_engine = manager_session.metadata_json.get("preferred_engine")
+        allow_simulation_fallback = manager_session.metadata_json.get("allow_simulation_fallback")
+        simulation_mode = manager_session.metadata_json.get("simulation_mode")
+        model = manager_session.metadata_json.get("model")
+        launch_plan = self.session_supervisor.plan_session(
+            role=SessionRole.MANAGER,
+            command_override=manager_session.command,
+            runtime_preference=str(preferred_engine) if preferred_engine else None,
+            allow_simulation_fallback=(
+                bool(allow_simulation_fallback) if allow_simulation_fallback is not None else True
+            ),
+            simulation_mode=bool(simulation_mode) if simulation_mode is not None else None,
+        )
+
+        metadata: dict[str, Any] = {
+            "session_kind": "portfolio_planning_turn",
+            "preferred_engine": preferred_engine or "auto",
+            "allow_simulation_fallback": allow_simulation_fallback,
+            "simulation_mode": launch_plan.simulation_mode,
+            "launch_notes": launch_plan.notes,
+            "runtime": launch_plan.runtime.model_dump(mode="json"),
+            "automation": {
+                "manager_session_id": str(manager_session.id),
+                "launched_at": datetime.now(UTC).isoformat(),
+            },
+        }
+        if model is not None:
+            metadata["model"] = str(model)
+
+        turn_session = SessionModel(
+            portfolio_id=portfolio.id,
+            project_id=None,
+            supervisor_session_id=manager_session.id,
+            role=SessionRole.MANAGER,
+            status=launch_plan.initial_status,
+            transport=launch_plan.transport,
+            adapter_kind=launch_plan.adapter_kind,
+            command=launch_plan.command,
+            workspace_path=manager_session.workspace_path or self._manager_workspace_path(portfolio),
+            blocked_reason=launch_plan.blocked_reason,
+            metadata_json=metadata,
+            runtime_metadata_json={},
+        )
+        db.add(turn_session)
+        db.flush()
+        db.commit()
+        db.refresh(turn_session)
+
+        if turn_session.status == SessionStatus.PENDING:
+            try:
+                self.session_supervisor.start_session(turn_session.id)
+            except Exception as exc:
+                self._mark_turn_processed(db, turn_session, reason=f"planning_start_failed:{exc}")
+                return self._action(
+                    kind="planning_turn_failed",
+                    portfolio_id=portfolio.id,
+                    session_id=turn_session.id,
+                    detail=f"Failed to start planning turn: {exc}",
+                )
+        elif turn_session.status == SessionStatus.BLOCKED:
+            self._mark_turn_processed(db, turn_session, reason=turn_session.blocked_reason or "planning_blocked")
+            return self._action(
+                kind="planning_turn_blocked",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail=f"Planning turn blocked: {turn_session.blocked_reason}",
+            )
+
+        services.event_service.record_event(
+            EventCreate(
+                category=EventCategory.PROJECT,
+                event_type="portfolio.planning_turn_started",
+                level=EventLevel.INFO,
+                source=EventSourceRef(kind="service", role=SessionRole.MANAGER, id="portfolio-automation"),
+                payload={
+                    "portfolio_id": str(portfolio.id),
+                    "manager_session_id": str(manager_session.id),
+                    "planning_session_id": str(turn_session.id),
+                },
+            )
+        )
+        return self._action(
+            kind="planning_turn_started",
+            portfolio_id=portfolio.id,
+            session_id=turn_session.id,
+            detail=f"Started a portfolio planning turn to decompose the goal.",
+        )
+
+    def _process_completed_planning_turns(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+    ) -> PortfolioAutomationActionRead | None:
+        for turn_session in self._planning_turn_sessions(db, portfolio.id):
+            if self._turn_processed(turn_session):
+                continue
+            if turn_session.status not in TERMINAL_SESSION_STATUSES:
+                continue
+            return self._resolve_completed_planning_turn(
+                db=db,
+                services=services,
+                portfolio=portfolio,
+                turn_session=turn_session,
+            )
+        return None
+
+    def _resolve_completed_planning_turn(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+        turn_session: SessionModel,
+    ) -> PortfolioAutomationActionRead:
+        if turn_session.status != SessionStatus.COMPLETED:
+            self._mark_turn_processed(db, turn_session, reason=f"planning_turn_{turn_session.status.value}")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail=f"Planning turn ended with status {turn_session.status.value}.",
+            )
+
+        complete_event = db.scalar(
+            select(ParsedSessionEvent)
+            .where(
+                ParsedSessionEvent.session_id == turn_session.id,
+                ParsedSessionEvent.event_type == StructuredEventType.COMPLETE,
+            )
+            .order_by(ParsedSessionEvent.sequence.desc())
+        )
+        if complete_event is None:
+            ended_at = self._coerce_utc(turn_session.ended_at)
+            if ended_at is None or (datetime.now(UTC) - ended_at).total_seconds() < 1.0:
+                return self._action(
+                    kind="planning_turn_waiting_for_events",
+                    portfolio_id=portfolio.id,
+                    session_id=turn_session.id,
+                    detail="Planning turn finished, but structured events are still settling.",
+                )
+            self._mark_turn_processed(db, turn_session, reason="no_complete_event")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail="Planning turn completed without a structured complete event.",
+            )
+
+        payload = dict(complete_event.payload_json)
+        result = str(payload.get("result") or "").strip().lower()
+
+        if result == "decompose":
+            return self._handle_decompose_result(
+                db=db,
+                services=services,
+                portfolio=portfolio,
+                turn_session=turn_session,
+                payload=payload,
+            )
+        elif result == "single_project":
+            return self._handle_single_project_result(
+                db=db,
+                services=services,
+                portfolio=portfolio,
+                turn_session=turn_session,
+                payload=payload,
+            )
+        else:
+            self._mark_turn_processed(db, turn_session, reason=f"unknown_planning_result:{result}")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail=f"Planning turn returned unknown result: {result}",
+            )
+
+    def _handle_decompose_result(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+        turn_session: SessionModel,
+        payload: dict[str, Any],
+    ) -> PortfolioAutomationActionRead:
+        projects_data = payload.get("projects")
+        if not isinstance(projects_data, list) or len(projects_data) < 1:
+            self._mark_turn_processed(db, turn_session, reason="decompose_no_projects")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail="Decompose result missing projects list.",
+            )
+
+        created_project_ids: list[UUID] = []
+        # Create a parent project to group sub-projects
+        try:
+            parent_project = services.project_service.create_project(
+                ProjectCreate(
+                    portfolio_id=portfolio.id,
+                    name=f"{portfolio.name} - Root",
+                    create_repo=True,
+                    objective=portfolio.goal,
+                    metadata={"is_parent": True, "decomposed": True},
+                )
+            )
+        except Exception as exc:
+            self._mark_turn_processed(db, turn_session, reason=f"parent_project_create_failed:{exc}")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail=f"Failed to create parent project: {exc}",
+            )
+
+        for sub in projects_data:
+            if not isinstance(sub, dict):
+                continue
+            name = str(sub.get("name") or "").strip()
+            objective = str(sub.get("objective") or "").strip()
+            if not name or not objective:
+                continue
+
+            try:
+                sub_project = services.project_service.create_project(
+                    ProjectCreate(
+                        portfolio_id=portfolio.id,
+                        parent_project_id=parent_project.id,
+                        name=name,
+                        create_repo=True,
+                        objective=objective,
+                        metadata={"decomposed_from": str(parent_project.id)},
+                    )
+                )
+                created_project_ids.append(sub_project.id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to create sub-project %r for portfolio %s: %s",
+                    name,
+                    portfolio.id,
+                    exc,
+                )
+                continue
+
+        if not created_project_ids:
+            self._mark_turn_processed(db, turn_session, reason="decompose_all_projects_failed")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail="Decompose result: all sub-project creations failed.",
+            )
+
+        # Start workers on each sub-project
+        started_count = 0
+        for project_id in created_project_ids:
+            try:
+                services.project_service.start_project(
+                    project_id,
+                    ProjectStartRequest(
+                        runtime_preference=str(
+                            turn_session.metadata_json.get("preferred_engine") or "auto"
+                        ),
+                        allow_simulation_fallback=turn_session.metadata_json.get("allow_simulation_fallback"),
+                        simulation_mode=turn_session.metadata_json.get("simulation_mode"),
+                        model=turn_session.metadata_json.get("model"),
+                        metadata={"auto_started_by_planning": True},
+                    ),
+                )
+                started_count += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to start sub-project %s: %s",
+                    project_id,
+                    exc,
+                )
+
+        self._mark_turn_processed(db, turn_session, reason=f"decomposed:{len(created_project_ids)}_projects")
+
+        services.event_service.record_event(
+            EventCreate(
+                category=EventCategory.PROJECT,
+                event_type="portfolio.planning_decomposed",
+                level=EventLevel.INFO,
+                source=EventSourceRef(kind="service", role=SessionRole.MANAGER, id="portfolio-automation"),
+                payload={
+                    "portfolio_id": str(portfolio.id),
+                    "parent_project_id": str(parent_project.id),
+                    "sub_project_ids": [str(pid) for pid in created_project_ids],
+                    "started_count": started_count,
+                },
+            )
+        )
+        return self._action(
+            kind="planning_decomposed",
+            portfolio_id=portfolio.id,
+            session_id=turn_session.id,
+            detail=f"Decomposed portfolio goal into {len(created_project_ids)} sub-projects, started {started_count} workers.",
+            payload={
+                "parent_project_id": str(parent_project.id),
+                "sub_project_ids": [str(pid) for pid in created_project_ids],
+            },
+        )
+
+    def _handle_single_project_result(
+        self,
+        *,
+        db: Session,
+        services: _ScopedServices,
+        portfolio: Portfolio,
+        turn_session: SessionModel,
+        payload: dict[str, Any],
+    ) -> PortfolioAutomationActionRead:
+        project_data = payload.get("project")
+        if not isinstance(project_data, dict):
+            project_data = {"name": portfolio.name, "objective": portfolio.goal}
+
+        name = str(project_data.get("name") or portfolio.name).strip()
+        objective = str(project_data.get("objective") or portfolio.goal).strip()
+
+        try:
+            project = services.project_service.create_project(
+                ProjectCreate(
+                    portfolio_id=portfolio.id,
+                    name=name,
+                    create_repo=True,
+                    objective=objective,
+                    metadata={"single_project_planning": True},
+                )
+            )
+        except Exception as exc:
+            self._mark_turn_processed(db, turn_session, reason=f"single_project_create_failed:{exc}")
+            return self._action(
+                kind="planning_turn_failed",
+                portfolio_id=portfolio.id,
+                session_id=turn_session.id,
+                detail=f"Failed to create project: {exc}",
+            )
+
+        try:
+            services.project_service.start_project(
+                project.id,
+                ProjectStartRequest(
+                    runtime_preference=str(
+                        turn_session.metadata_json.get("preferred_engine") or "auto"
+                    ),
+                    allow_simulation_fallback=turn_session.metadata_json.get("allow_simulation_fallback"),
+                    simulation_mode=turn_session.metadata_json.get("simulation_mode"),
+                    model=turn_session.metadata_json.get("model"),
+                    metadata={"auto_started_by_planning": True},
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to start project %s: %s", project.id, exc)
+
+        self._mark_turn_processed(db, turn_session, reason="single_project_created")
+
+        services.event_service.record_event(
+            EventCreate(
+                category=EventCategory.PROJECT,
+                event_type="portfolio.planning_single_project",
+                level=EventLevel.INFO,
+                source=EventSourceRef(kind="service", role=SessionRole.MANAGER, id="portfolio-automation"),
+                payload={
+                    "portfolio_id": str(portfolio.id),
+                    "project_id": str(project.id),
+                },
+            )
+        )
+        return self._action(
+            kind="planning_single_project",
+            portfolio_id=portfolio.id,
+            session_id=turn_session.id,
+            detail=f"Created single project '{name}' and started worker.",
+            payload={"project_id": str(project.id)},
         )
 
     def _handoff_to_human(

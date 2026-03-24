@@ -1,5 +1,7 @@
 from app.models.artifact import Artifact
 from app.models.base import Base
+from app.models.business import Business
+from app.models.business_cycle import BusinessCycle
 from app.models.event import Event
 from app.models.parsed_session_event import ParsedSessionEvent
 from app.models.portfolio import Portfolio
@@ -14,6 +16,8 @@ from app.models.workspace import Workspace
 __all__ = [
     "Artifact",
     "Base",
+    "Business",
+    "BusinessCycle",
     "Event",
     "ParsedSessionEvent",
     "Portfolio",

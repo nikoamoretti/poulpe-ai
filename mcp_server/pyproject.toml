@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poulpe-mcp-bridge"
+version = "0.1.0"
+description = "MCP server that lets Codex workers talk to the Poulpe manager via blocking tool calls."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0,<2.0",
+  "httpx>=0.28,<1.0",
+]
